@@ -160,6 +160,8 @@ Some bundles ship a **skill** — a written guide to using their tools well, cov
 |-------|--------|--------|
 | `feynrules` | Declaring mass and width once, tagging BSM couplings with an interaction order, checking the UFO before MG5 sees it | `feynrules` |
 | `mg5` | Shallow comma decay chains and the `NP=N` alternative, `compute_widths` ordering, reading past MG5's auto-conversion error mask | `mg5` |
+| `cmssw` | Taking a UFO model from a validated MG5 process through a CMS genproductions gridpack and CMSSW's Pythia8 GEN step — custom-model resolution, cvmfs vs. local tarball scripts, MLM matching, and validating a sample with no matching Rivet routine | `mg5` |
+| `central-production` | Reproducing an existing central CMS dataset's full chain from a McM chained request — matching request count to cmsDriver count, stripping the root fragment's built-in filters, crossing CMSSW releases mid-chain, Premix pileup's grid-proxy requirement, and NANOEDMAODSIM vs. flat NANOAODSIM | `mg5` |
 
 Each skill names a bundle, and `tb connect` surfaces it only when that bundle's tools are actually being served — so the `mg5` guide stays hidden until `mg5_path` is set, since without it the tools it describes aren't there either. `tb deactivate heptapod__mg5` turns one off; `tb activate` turns it back on.
 
