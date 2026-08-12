@@ -1,0 +1,43 @@
+# genproductions-style proc card — cards/<process_name>/<process_name>_proc_card.dat
+#
+# Unlike an interactive `.mg5` session (see the mg5 skill's mg5_card_template.mg5),
+# this file has no `launch` — gridpack_generation.sh drives generation,
+# integration-grid setup, and the test run itself. Keep it to import/generate/output.
+
+# Only needed for loop-induced / NLO processes; harmless otherwise.
+# set low_mem_multicore_nlo_generation True
+
+# --- Model import -----------------------------------------------------------
+# Pick ONE of the three cases below (pitfall 1 in SKILL.md).
+#
+# (a) Stock model MG5 already ships — bare name:
+#   import model loop_sm-ckm_no_b_mass
+#
+# (b) BSM model published to the CMS generators web area — bare name, matching
+#     the directory name INSIDE the archive. Also create a sibling file
+#     cards/<process_name>/<process_name>_extramodels.dat containing just the
+#     archive filename, e.g.  my_bsm_model.tgz
+#     genproductions wgets it from cms-project-generators and unpacks it into
+#     the sandboxed MG5's models/ before generation.
+#   import model my_bsm_model
+#
+# (c) Private UFO still on local disk — absolute path, NO _extramodels.dat.
+#     MG5 resolves this during code generation, which runs on the machine
+#     invoking gridpack_generation.sh. Fine for private studies; breaks if
+#     generation is farmed to batch nodes without a shared filesystem.
+import model /absolute/path/to/<UFO_MODEL_DIR_NAME>
+#
+# In all three cases the finished gridpack is self-contained: the tarball
+# packs mgbasedir (including models/) and process, so CMSSW needs no copy
+# of the UFO at showering time.
+
+# --- Process ------------------------------------------------------------
+# Replace with your validated process (validate interactively first — mg5 skill).
+# For a BSM process, decide here whether decays are computed in MG5
+# (comma/parenthesis chains, or an explicit n-body ME with NP=N — see the mg5
+# skill) or left to Pythia/BuildDecayTableTool downstream.
+generate p p > <your process>
+# add process p p > <your process> j   # optional: +1 jet, needs MLM matching
+#                                        # downstream (see pitfalls.md)
+
+output <process_name> -nojpeg
