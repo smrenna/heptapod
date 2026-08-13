@@ -155,6 +155,15 @@ cmsDriver.py --eventcontent NANOAODSIM --datatier NANOAODSIM --step NANO ...
 
 ## Environment and checklist
 
+On an EL9 host, don't skip the EL8 container even if an early step (e.g.
+GEN-SIM/DIGI-RECO) happens to run fine unwrapped — that's not proof the whole
+chain is safe outside it. The MiniAOD/PAT step in particular pulls in a plugin
+that needs `libssl.so.1.1`, which EL9 doesn't ship, and fails at `cmsRun` time
+with `error while loading shared libraries: libssl.so.1.1: cannot open shared
+object file` — misleading because it surfaces steps into the chain, not up
+front. Wrap production commands with `cmssw-el8 --command-to-run bash
+<script>` (lives at `/cvmfs/cms.cern.ch/common/cmssw-el8`).
+
 ```bash
 # 0. EL8 container + grid proxy — needed before anything else
 cmssw-el8
