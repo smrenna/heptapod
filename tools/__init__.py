@@ -18,6 +18,7 @@ at serve time.
 # skip handles the per-tool surfacing.
 for _name in (
     "analysis",
+    "central_production",
     "eda",
     "feyngraph",
     "feynrules",

@@ -83,6 +83,13 @@ bundles:
   # ── BSM model UFO generation via Mathematica/FeynRules ───────────
   feynrules:
     requires: [feynrules_path, wolframscript_path]
+
+  # ── reproduce central CMS production chains via McM/DAS ──────────
+  # No pip deps: talks to McM's public REST API (requests, already in the
+  # base install) and shells out to `dasgoclient`, which comes from
+  # `source /cvmfs/cms.cern.ch/cmsset_default.sh` in a CMS environment,
+  # not from this toolkit's venv.
+  central_production: {}
 tools:
   - module: tools.analysis.conversions
     name: EventJSONLToNumpyTool
@@ -172,6 +179,13 @@ tools:
     description: Build a Pythia-readable decay-table fragment to decay a BSM state the
       LHE left stable (e.g. GMSB neutralino -> photon + gravitino).
     bundle: bsm
+  - module: tools.central_production.mcm_chain
+    name: MCMChainTool
+    description: Resolve a central CMS dataset or McM request prepid into the
+      ordered, structured chain of production steps (release, SCRAM_ARCH,
+      parsed cmsDriver args) that actually produced it, from GEN-SIM through
+      the requested tier.
+    bundle: central_production
   - module: tools.eda.compute_symbolic_amplitude_tool
     name: ComputeSymbolicAmplitude
     description: Generate FeynCalc code with symbolic masses and couplings.
