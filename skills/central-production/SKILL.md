@@ -155,14 +155,22 @@ cmsDriver.py --eventcontent NANOAODSIM --datatier NANOAODSIM --step NANO ...
 
 ## Environment and checklist
 
-On an EL9 host, don't skip the EL8 container even if an early step (e.g.
-GEN-SIM/DIGI-RECO) happens to run fine unwrapped — that's not proof the whole
-chain is safe outside it. The MiniAOD/PAT step in particular pulls in a plugin
-that needs `libssl.so.1.1`, which EL9 doesn't ship, and fails at `cmsRun` time
-with `error while loading shared libraries: libssl.so.1.1: cannot open shared
-object file` — misleading because it surfaces steps into the chain, not up
-front. Wrap production commands with `cmssw-el8 --command-to-run bash
-<script>` (lives at `/cvmfs/cms.cern.ch/common/cmssw-el8`).
+On an EL9 host, don't skip the EL8 container just because an early step ran
+fine unwrapped — that is not evidence the rest of the chain will. Observed on
+`CMSSW_13_0_13` (Run3Summer22EE, `el8_amd64_gcc11`): GEN-SIM and DIGI-RECO
+both completed unwrapped, and then the MiniAOD/PAT step pulled in a plugin
+needing `libssl.so.1.1`, which EL9 doesn't ship, and died at `cmsRun` time:
+
+```
+cmsRun: error while loading shared libraries: libssl.so.1.1: cannot open shared object file
+```
+
+Which step trips first — and which library it asks for — is release-specific;
+verified for this one chain, not universal. What generalizes is the shape of
+the failure: it surfaces several steps in, long after an unwrapped run has
+already looked safe. So wrap production commands from the start with
+`cmssw-el8 --command-to-run bash <script>`
+(`cmssw-el8` lives at `/cvmfs/cms.cern.ch/common/cmssw-el8`).
 
 ```bash
 # 0. EL8 container + grid proxy — needed before anything else
