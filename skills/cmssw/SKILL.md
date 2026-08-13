@@ -90,19 +90,26 @@ where this logic is inherited but worth a one-line confirmation on first use:
 grep -n "extramodels" genproductions_scripts/bin/MadGraph5_aMCatNLO/gridpack_generation.sh
 ```
 
-### 2. cvmfs-only vs. local-path tarball scripts — pick the one that matches where the gridpack actually lives
+### 2. The tarball script names are backwards from what you'd guess — `_cvmfs` is the one that reads a local path
 
-The tutorial's fragment points `ExternalLHEProducer` at
-`GeneratorInterface/LHEInterface/data/run_generic_tarball_cvmfs.sh`, which
-assumes the gridpack has already gone through CMS's official publication
-pipeline onto `/cvmfs`. A gridpack you just built locally is **not** there.
-Using the `_cvmfs` script against a local path fails opaquely (the job can't
-resolve the tarball). For a private/BSM gridpack still on local disk, use the
-non-cvmfs variant instead:
+Both `ExternalLHEProducer` helper scripts live in
+`GeneratorInterface/LHEInterface/data/`, and the naming misleads:
+
+- **`run_generic_tarball_cvmfs.sh`** takes a single **plain filesystem path**
+  (`path=${1}`, then nevt/rnum/ncpu). "cvmfs" is where such tarballs usually
+  sit, *not* a requirement — a local scratch path works fine.
+- **`run_generic_tarball.sh`** takes the location as **two** arguments
+  (`repo=${1}`, `name=${2}`) and fetches via
+  `fn-fileget -c $(cmsGetFnConnect frontier://smallfiles) ${repo}/${name}`.
+  It has **no local-file code path at all** and cannot read a gridpack off
+  disk.
+
+So for a gridpack you just built — the normal private/BSM case — use the
+`_cvmfs` script, even though the tarball is not on `/cvmfs`:
 
 ```python
 externalLHEProducer = cms.EDProducer('ExternalLHEProducer',
-  scriptName = cms.FileInPath("GeneratorInterface/LHEInterface/data/run_generic_tarball.sh"),
+  scriptName = cms.FileInPath("GeneratorInterface/LHEInterface/data/run_generic_tarball_cvmfs.sh"),
   outputFile = cms.string("cmsgrid_final.lhe"),
   numberOfParameters = cms.uint32(1),
   args = cms.vstring('/absolute/path/to/your_model_gridpack.tar.xz'),
@@ -110,8 +117,12 @@ externalLHEProducer = cms.EDProducer('ExternalLHEProducer',
 )
 ```
 
-Switch back to `_cvmfs` only once the gridpack has actually been placed on
-cvmfs (a separate, official CMS production step — out of scope here).
+Getting this backwards fails in a way that does not point at the cause: the
+path becomes `repo`, `ExternalLHEProducer`'s appended nEvents becomes `name`,
+and the job tries to fetch `<tarball>.tar.xz/100` over frontier, ending in
+`FileOpenError ... Failed to open the file 'cmsgrid_final.lhe'` — several
+minutes in, after Geant4 starts. Full symptom and the quoted source of both
+scripts are in `references/pitfalls.md` P2.
 
 ### 3. The tutorial's Rivet routines are SM-ttbar-specific; they will not validate a BSM sample
 
@@ -188,7 +199,12 @@ cp path/to/interactive/output/Cards/run_card.dat \
 #      git clone https://github.com/cms-sw/genproductions.git
 git clone ssh://git@gitlab.cern.ch:7999/cms-gen/genproductions_scripts.git
 cd genproductions_scripts/bin/MadGraph5_aMCatNLO
-./gridpack_generation.sh <process_name> /path/to/cards/<process_name>
+# The cards dir argument is RELATIVE to this directory, not absolute: the
+# script does `CARDSDIR=${PRODHOME}/${carddir}` with no leading-slash check,
+# so an absolute path is concatenated onto PRODHOME and reported as
+# "<PRODHOME>//abs/path  does not exist!". Easiest is to keep the cards under
+# this tree, as the repo's own cards/production/... layout does.
+./gridpack_generation.sh <process_name> cards/<process_name>
 
 # 4. Wire the gridpack into a CMSSW fragment (references/gridpack_fragment_template.py)
 #    — pick the local-path or cvmfs ExternalLHEProducer script (pitfall 2)
@@ -218,10 +234,11 @@ rivet-mkhtml --mc-errs *.yoda   # only if a matching routine exists
 
 - **`references/pitfalls.md`** — the full pitfall list, with the relevant
   `gridpack_generation.sh` code quoted: `_extramodels.dat` being network-only
-  and the two workarounds, the cvmfs/local tarball-script split, MLM
-  jet-matching double-counting when adding extra partons at LO, stable BSM
-  states surviving the LHE, `QNUMBERS` blocks and silently-ignored colliding
-  PDG codes, and SCRAM_ARCH/genproductions-MG5-version mismatches.
+  and the two workarounds, the misleadingly-named tarball scripts (`_cvmfs` is
+  the local-path one), MLM jet-matching double-counting when adding extra
+  partons at LO, stable BSM states surviving the LHE, `QNUMBERS` blocks and
+  silently-ignored colliding PDG codes, SCRAM_ARCH/genproductions-MG5-version
+  mismatches, and the empty-`processParameters` segfault.
 - **`references/proc_card_template.dat`** — a minimal genproductions-style
   proc card (no `launch`; `import model`/`generate`/`output` only), with all
   three `import model` cases from pitfall 1 spelled out.

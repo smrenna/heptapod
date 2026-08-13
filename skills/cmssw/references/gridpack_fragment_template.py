@@ -10,26 +10,31 @@ from Configuration.Generator.Pythia8CommonSettings_cfi import *
 from Configuration.Generator.MCTunes2017.PythiaCP5Settings_cfi import *
 
 # --- Point at the gridpack ---------------------------------------------
-# Pick ONE of the two scripts below (pitfall 2 in SKILL.md) — using the
-# wrong one against a locally-built gridpack fails opaquely.
+# Pick ONE of the two scripts below (pitfall 2 in SKILL.md). The names are
+# backwards from what you'd guess: `_cvmfs` takes a plain filesystem path,
+# while the un-suffixed script can ONLY fetch through the frontier smallfiles
+# service and cannot read local disk at all.
 
-# (a) Gridpack still on local disk (the normal case for a model you just
-#     built yourself — use this one first):
+# (a) Gridpack on any mounted filesystem — local scratch OR /cvmfs. This is
+#     the normal case for a model you just built yourself, and yes, it is the
+#     `_cvmfs` script even when the tarball is not on /cvmfs:
 externalLHEProducer = cms.EDProducer('ExternalLHEProducer',
-  scriptName = cms.FileInPath("GeneratorInterface/LHEInterface/data/run_generic_tarball.sh"),
+  scriptName = cms.FileInPath("GeneratorInterface/LHEInterface/data/run_generic_tarball_cvmfs.sh"),
   outputFile = cms.string("cmsgrid_final.lhe"),
   numberOfParameters = cms.uint32(1),
   args = cms.vstring('/absolute/path/to/<process_name>_gridpack.tar.xz'),
   nEvents = cms.untracked.uint32(10000)
 )
 
-# (b) Gridpack officially published to /cvmfs (only after CMS's separate
-#     publication step — swap in once that's actually true):
+# (b) Gridpack published to the CMS frontier smallfiles repository. Note this
+#     script takes TWO location arguments (repo, then filename), so
+#     numberOfParameters must be 2 — passing a single path here makes
+#     ExternalLHEProducer's appended nEvents get read as the filename:
 # externalLHEProducer = cms.EDProducer('ExternalLHEProducer',
-#   scriptName = cms.FileInPath("GeneratorInterface/LHEInterface/data/run_generic_tarball_cvmfs.sh"),
+#   scriptName = cms.FileInPath("GeneratorInterface/LHEInterface/data/run_generic_tarball.sh"),
 #   outputFile = cms.string("cmsgrid_final.lhe"),
-#   numberOfParameters = cms.uint32(1),
-#   args = cms.vstring('/cvmfs/path/to/published_tarball.tar.xz'),
+#   numberOfParameters = cms.uint32(2),
+#   args = cms.vstring('<repo>', '<published_tarball.tar.xz>'),
 #   nEvents = cms.untracked.uint32(10000)
 # )
 
@@ -40,6 +45,17 @@ generator = cms.EDFilter("Pythia8HadronizerFilter",
     filterEfficiency = cms.untracked.double(1.0),
     pythiaHepMCVerbosity = cms.untracked.bool(False),
     comEnergy = cms.double(13000.),
+    # !! If you end up with NOTHING uncommented inside processParameters --
+    # !! which is the common case for a gridpack whose BSM states are already
+    # !! decayed in the matrix element -- you must DELETE the block entirely
+    # !! AND remove 'processParameters' from parameterSets below. An empty
+    # !! vstring that is still named in parameterSets SEGFAULTS cmsRun in
+    # !! gen::ParameterCollector::const_iterator::next(), via
+    # !! Py8InterfaceBase::readSettings() at beginLuminosityBlockProduce.
+    # !! There is no exception and no error message -- just
+    # !! "A fatal system signal has occurred: segmentation violation" and a
+    # !! ~250-byte ROOT stub. Leaving the block out is fine; leaving it empty
+    # !! is not.
     PythiaParameters = cms.PSet(
         pythia8CommonSettingsBlock,
         pythia8CP5SettingsBlock,

@@ -67,25 +67,55 @@ The CMSDAS exercise uses the newer `cms-gen/genproductions_scripts` split-off,
 which inherits this logic; confirm on first use with
 `grep -n "extramodels" .../gridpack_generation.sh`.
 
-## P2 — `run_generic_tarball_cvmfs.sh` vs. `run_generic_tarball.sh`
+## P2 — `run_generic_tarball_cvmfs.sh` vs. `run_generic_tarball.sh` — the `_cvmfs` one is what you want for a LOCAL gridpack
 
-The tutorial's `ExternalLHEProducer` fragment uses
-`GeneratorInterface/LHEInterface/data/run_generic_tarball_cvmfs.sh`. This
-script expects `args` to be a path that resolves on `/cvmfs` — i.e. the
-gridpack has already gone through CMS's official publication pipeline. A
-gridpack you just built with `gridpack_generation.sh` sits on local disk and
-is not there.
+The names are actively misleading. Despite the suffix, **`_cvmfs` is the
+variant that takes a plain filesystem path**, and the un-suffixed script is the
+one that cannot read local disk at all. Both scripts are short; read them in
+your release rather than trusting the names:
 
-Using the `_cvmfs` script against a local path is a **quiet** failure mode:
-the job doesn't complain about a malformed config, it just can't resolve the
-tarball at run time, and the error can look like an infrastructure problem
-rather than a wrong-script-choice problem.
+`run_generic_tarball.sh` takes the gridpack location as **two** arguments and
+fetches it through the CMS frontier *smallfiles* service — there is no local-file
+code path in it:
 
-**Fix**: for a locally-built gridpack, use
-`GeneratorInterface/LHEInterface/data/run_generic_tarball.sh` (no `_cvmfs`
-suffix), pointed at the tarball's actual filesystem path. Switch to the
-`_cvmfs` variant only once the tarball has actually gone through official
-publication — a separate CMS process, out of scope here.
+```bash
+repo=${1}; name=${2}; nevt=${3}; rnum=${4}; ncpu=${5}
+fn-fileget -c `cmsGetFnConnect frontier://smallfiles` ${repo}/${name}
+```
+
+`run_generic_tarball_cvmfs.sh` takes a single path and uses it directly:
+
+```bash
+path=${1}; nevt=${2}; rnum=${3}; ncpu=${4}
+```
+
+The `cvmfs` in that name describes where such tarballs *usually* live, not a
+requirement — any mounted path works, including scratch/`/uscms_data`.
+
+**Symptom if you get it backwards** (verified on CMSSW_12_4_11_patch3, with
+`numberOfParameters = 1` and one local path in `args`): the path lands in
+`repo`, and `ExternalLHEProducer`'s automatically-appended nEvents becomes
+`name`, so the job tries to fetch the literal string `<tarball>.tar.xz/100`
+over frontier:
+
+```
+%MSG-MG5 gridpack = 100
+Error getting data for /path/to/..._tarball.tar.xz/100: [frontier.c:1136]: No more proxies.
+  ... smallfiles Exception: Cannot read file /path/to/..._tarball.tar.xz/100
+tar: Error is not recoverable: exiting now
+run_generic_tarball.sh: line 46: ./runcmsgrid.sh: No such file or directory
+----- Begin Fatal Exception -----
+An exception of category 'FileOpenError' ... Failed to open the file 'cmsgrid_final.lhe'
+```
+
+The `FileOpenError` on `cmsgrid_final.lhe` is a downstream symptom — the LHE was
+never produced because the fetch failed. Note this surfaces only *after* Geant4
+initialisation, several minutes into the job.
+
+**Fix**: use `run_generic_tarball_cvmfs.sh` with the tarball's absolute
+filesystem path, whether or not it is on `/cvmfs`. Reserve
+`run_generic_tarball.sh` for gridpacks actually published to the frontier
+smallfiles repository, and give it both `repo` and `name` arguments.
 
 ## P3 — MLM jet matching is required, not optional, once you add an extra parton at LO
 
@@ -174,3 +204,46 @@ CMSSW release on a different architecture will fail. Keep the `cmsenv` you
 built the gridpack under and the one you shower it in on the same
 `SCRAM_ARCH` unless you know the gridpack is architecture-portable (LHE
 generation is compiled Fortran/C++, not necessarily portable).
+
+## P7 — An EMPTY `processParameters` block segfaults cmsRun with no error message
+
+If your model needs none of the optional Pythia settings — the usual case when
+the BSM states are decayed in the matrix element and no PDG code collides
+(P4/P5 both inapplicable) — it is tempting to leave the block in place with
+everything commented out:
+
+```python
+processParameters = cms.vstring(
+    # nothing applies to this model
+),
+...
+parameterSets = cms.vstring('pythia8CommonSettings',
+                            'pythia8CP5Settings',
+                            'processParameters')   # <-- still listed
+```
+
+That crashes. `ParameterCollector` walks each block named in `parameterSets`
+and runs off the end of an empty one:
+
+```
+Module: Pythia8HadronizerFilter:generator (crashed)
+A fatal system signal has occurred: segmentation violation
+
+#5 gen::ParameterCollector::const_iterator::next()
+#6 gen::Py8InterfaceBase::readSettings(int)
+#7 edm::HadronizerFilter<Pythia8Hadronizer, gen::ExternalDecayDriver>::beginLuminosityBlockProduce(...)
+```
+
+There is no exception, no configuration error, and no hint that a parameter
+block is to blame — just a signal and a ~250-byte ROOT stub. Because it fires
+at `beginLuminosityBlock`, it happens *after* Geant4 initialisation, so several
+minutes of the job look healthy first.
+
+**Fix**: delete the block from the `PSet` **and** remove its name from
+`parameterSets`. Present-and-empty is the broken state; absent is fine.
+
+**While debugging any of this**: a segfault writes no "Fatal Exception" line
+and still leaves a small non-empty output file, so `[ -s output.root ]` and
+"grep for Fatal Exception" both report success on a crashed job. If you wrap
+these steps in a script, gate on a completed `TimeReport> Time report complete`
+plus a plausible file size, and grep for `segmentation violation` too.
