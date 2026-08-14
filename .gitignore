@@ -50,6 +50,13 @@ examples/primer/cms_dimuon/
 # Shared repo guidance goes in the tracked CLAUDE.md instead.
 /CLAUDE.local.md
 
+# Reference-only clone of the CMS central card corpus, cloned here for
+# convenience. Not vendored: it is ~20 MB of another project's files, it needs
+# a CERN account to pull, and it moves independently of this repo. What we
+# learned from it is written down in skills/cmssw/references/card_corpus.md.
+#   git clone ssh://git@gitlab.cern.ch:7999/cms-gen/genproductions_cards.git
+/genproductions_cards/
+
 # Agent wiring written by `tb connect` — per-clone, and it names the toolbase
 # binary in YOUR environment, so it does not transfer between machines. Every
 # user runs `tb connect` themselves (see the README). What the agent is served

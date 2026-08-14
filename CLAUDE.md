@@ -22,13 +22,35 @@ this file is environment/repo notes for working on the codebase itself.
   each step's real `cmsDriver` command from its McM chained request. This is
   the one for "make me events that look like dataset X."
 
+## CMS-internal material: ask before reading, never quote into this repo
+
+This repo is a **public** fork. Some CMS sources are access-controlled, and
+reading one into an agent session copies it into a conversation transcript
+that leaves this machine — an irreversible step that no later edit undoes.
+
+Treat as internal, and **ask before reading**, anything under:
+
+- a clone of a `gitlab.cern.ch` repository (`genproductions_cards`, analysis
+  repos, CMSDAS material) — the clone URL in `git remote -v` is the tell;
+- CMS-internal web services and their local caches — McM beyond its public
+  read-only REST API, CADI, the CMS TWiki;
+- any directory whose contents imply an unpublished analysis: production
+  cards with specific mass points, unreleased datasets, private ntuples.
+
+By contrast, `github.com/cms-sw/genproductions`, the public McM REST API, and
+DAS query output are public and fine to read freely. When in doubt, the
+question is cheap and the read is not reversible.
+
+**When internal material informs a skill, write down the technique, not the
+artifact.** Conventions, mechanisms, failure modes, and aggregate counts are
+portable and carry no analysis content. Verbatim cards, process and dataset
+names, model archive paths, coupling values, and mass points identify what CMS
+is producing and must not land in tracked files — use a synthetic, internally
+consistent example instead (see `skills/cmssw/references/pitfalls.md` P4 for
+the pattern). Reference clones stay gitignored and out of the tree.
+
 ## Gotchas specific to this account/cluster (not covered in the skills, which are written to be portable)
 
-- **Home quota is razor-thin.** `homesrv01.fnal.gov:/uscms` (this user's
-  `$HOME`) has only a **3072M** quota. `curl`/installers fail partway through
-  with `Failed writing body` when it's hit, not a clear quota error. Check
-  with `quota -s`; the biggest reclaimable offenders are usually `~/.cache`
-  and `~/.npm` (safe to clear — caches, not data).
 - **`cmssw-el8` does not forward the `/uscms_data/d1` bind mount.** `d1` and
   `d2` are the same underlying storage outside the container (bind mount), so
   scripts/paths can use either — *except* inside `cmssw-el8`, where only `d2`
