@@ -22,10 +22,12 @@ badly misreported at run time:
     events and never errors.
 """
 
+import errno
 import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -120,10 +122,11 @@ def _scan_unreachable_inputs(
             continue
         if os.path.basename(match) in transferred_basenames:
             findings.append(
-                f"{match} is transferred in, but the cfg refers to it by "
-                "absolute path -- the worker sees it as "
-                f"./{os.path.basename(match)} in the job's scratch dir. "
-                "Change the cfg to the bare filename."
+                f"{match} is transferred in, so the job patch will rewrite it "
+                "to its absolute location in the scratch dir at run time -- no "
+                "action needed. (Do NOT 'fix' it to a bare filename: "
+                "ExternalLHEProducer's helper cds into lheevent/ before "
+                "untarring, so a relative path breaks.)"
             )
         else:
             findings.append(
@@ -137,15 +140,30 @@ def _scan_unreachable_inputs(
 
 def _build_seed_patch() -> str:
     """
-    Python appended to the cfg inside the job to make each job's events unique.
+    Python appended to the cfg inside the job. Two fixups, both silent failures
+    if omitted.
 
-    Seeds every module registered with RandomNumberGeneratorService rather than
-    naming `generator`/`externalLHEProducer` explicitly, so it stays correct
-    across cfgs with different module sets. Without this, `queue N` yields N
-    identical copies of the same events with no error anywhere.
+    **Seeding.** Seeds every module registered with RandomNumberGeneratorService
+    rather than naming `generator`/`externalLHEProducer` explicitly, so it stays
+    correct across cfgs with different module sets. Without this, `queue N`
+    yields N identical copies of the same events with no error anywhere.
+
+    **Gridpack path.** `ExternalLHEProducer` args must be ABSOLUTE at job run
+    time. Its helper `run_generic_tarball_cvmfs.sh` does
+
+        mkdir lheevent; cd lheevent
+        tar -xaf ${path}
+
+    so a relative path resolves inside `lheevent/` and the untar fails; while an
+    absolute path from the submitting node points at a filesystem the worker
+    cannot see at all. Either way the job dies minutes in, during Geant4 init,
+    with a `FileOpenError` on `cmsgrid_final.lhe` that names neither cause.
+    Rewriting each arg whose basename was transferred into the scratch dir to
+    that file's absolute location covers both. Args naming something not
+    transferred (a genuine /cvmfs gridpack) are left alone.
     """
     return '''
-# --- per-job seeding injected by heptapod CMSSWJobSubmitTool ---
+# --- per-job fixups injected by heptapod CMSSWJobSubmitTool ---
 import FWCore.ParameterSet.Config as cms
 _seed = int(os.environ["HEPTAPOD_SEED"])
 if hasattr(process, "RandomNumberGeneratorService"):
@@ -156,11 +174,18 @@ if hasattr(process, "RandomNumberGeneratorService"):
             _mod.initialSeed = cms.untracked.uint32(_seed)
 if hasattr(process, "source") and hasattr(process.source, "firstLuminosityBlock"):
     process.source.firstLuminosityBlock = cms.untracked.uint32(_seed)
+if hasattr(process, "externalLHEProducer"):
+    _args = []
+    for _a in process.externalLHEProducer.args:
+        _local = os.path.basename(_a)
+        _args.append(os.path.abspath(_local) if os.path.isfile(_local) else _a)
+    process.externalLHEProducer.args = cms.vstring(*_args)
+    print("[heptapod] externalLHEProducer.args ->", _args)
 '''
 
 
 def _build_wrapper(
-    cfg_file: str,
+    cfg_files: List[str],
     cmssw_release: str,
     scram_arch: str,
     output_files: List[str],
@@ -169,8 +194,15 @@ def _build_wrapper(
     n_threads: Optional[int] = None,
     local: bool = False,
 ) -> str:
-    """Emit the bash the job (or the local run) executes."""
-    cfg_base = os.path.basename(cfg_file)
+    """
+    Emit the bash the job (or the local run) executes.
+
+    `cfg_files` run in order in a single job, which is what you want for the
+    cheap tail of a production chain: intermediate files stay on the worker's
+    scratch disk instead of making a round trip through the schedd, and the
+    release area is set up once rather than once per step. Splitting steps
+    across clusters is only worth it when they need different releases.
+    """
     proc_expr = '"$1"' if not local else "0"
     threads_arg = f" -n {n_threads}" if n_threads else ""
 
@@ -204,17 +236,27 @@ def _build_wrapper(
         "eval `scramv1 runtime -sh`",
         "cd -",
         "",
-        "# Append per-job seeding to the cfg (see _build_seed_patch).",
-        f"cp {cfg_base} job_cfg.py",
         "export HEPTAPOD_SEED=$SEED",
-        "cat >> job_cfg.py <<'HEPTAPOD_SEED_PATCH'",
-        "import os",
-        _build_seed_patch().strip(),
-        "HEPTAPOD_SEED_PATCH",
-        "",
-        f"cmsRun{threads_arg} job_cfg.py",
-        "",
     ]
+
+    # Each cfg gets its own seeded copy and runs in order. A step that fails
+    # aborts the job (set -e), so a later step never runs on a truncated input.
+    for idx, cfg in enumerate(cfg_files):
+        cfg_base = os.path.basename(cfg)
+        job_cfg = f"job_cfg_{idx}.py"
+        lines += [
+            "",
+            f"# --- step {idx + 1}/{len(cfg_files)}: {cfg_base} ---",
+            f'echo "[heptapod] step {idx + 1}/{len(cfg_files)}: {cfg_base}"',
+            f"cp {cfg_base} {job_cfg}",
+            f"cat >> {job_cfg} <<'HEPTAPOD_SEED_PATCH'",
+            "import os",
+            _build_seed_patch().strip(),
+            "HEPTAPOD_SEED_PATCH",
+            f"cmsRun{threads_arg} {job_cfg}",
+        ]
+
+    lines.append("")
 
     for out in output_files:
         stem, ext = os.path.splitext(out)
@@ -347,7 +389,16 @@ class CMSSWJobSubmitTool(BaseTool):
     # ======================== Runtime fields ======================== #
     cfg_file: Optional[str] = RuntimeField(
         default=None,
-        description="Path to the cmsRun python cfg to run (e.g. step1_cfg.py)",
+        description="Path to the cmsRun python cfg to run (e.g. step1_cfg.py). "
+        "Single-cfg shorthand for cfg_files.",
+    )
+    cfg_files: Optional[List[str]] = RuntimeField(
+        default=None,
+        description="Several cfgs to run IN ORDER inside one job, e.g. "
+        "['digi_cfg.py', 'reco_cfg.py']. Preferred over separate clusters for "
+        "consecutive steps sharing a release: intermediates stay on the "
+        "worker's scratch instead of round-tripping through the schedd. Steps "
+        "needing different CMSSW releases must still be separate clusters.",
     )
     cmssw_release: Optional[str] = RuntimeField(
         default=None,
@@ -433,10 +484,11 @@ class CMSSWJobSubmitTool(BaseTool):
         self.base_directory = os.path.abspath(self.base_directory)
 
     def _run(self) -> str:
-        missing = [
-            n for n in ("cfg_file", "cmssw_release", "scram_arch")
-            if not getattr(self, n)
-        ]
+        raw_cfgs = list(self.cfg_files or ([self.cfg_file] if self.cfg_file else []))
+        missing = [n for n in ("cmssw_release", "scram_arch")
+                   if not getattr(self, n)]
+        if not raw_cfgs:
+            missing.insert(0, "cfg_file or cfg_files")
         if missing:
             return self.format_error(
                 error="Missing required input",
@@ -446,14 +498,29 @@ class CMSSWJobSubmitTool(BaseTool):
                            "was built for.",
             )
 
-        cfg_path = self.cfg_file
-        if not os.path.isabs(cfg_path):
-            cfg_path = os.path.join(self.base_directory, cfg_path)
-        if not os.path.isfile(cfg_path):
+        cfg_paths: List[str] = []
+        for cfg in raw_cfgs:
+            path = cfg if os.path.isabs(cfg) else os.path.join(
+                self.base_directory, cfg)
+            if not os.path.isfile(path):
+                return self.format_error(
+                    error="cfg not found",
+                    reason=f"{path!r} does not exist.",
+                    suggestion="Pass paths to existing cmsRun cfgs.",
+                )
+            cfg_paths.append(path)
+
+        # Distinct basenames: they are transferred into one flat scratch dir,
+        # so two cfgs with the same name would silently clobber each other.
+        basenames = [os.path.basename(p) for p in cfg_paths]
+        if len(set(basenames)) != len(basenames):
+            dupes = sorted({b for b in basenames if basenames.count(b) > 1})
             return self.format_error(
-                error="cfg not found",
-                reason=f"{cfg_path!r} does not exist.",
-                suggestion="Pass a path to an existing cmsRun cfg.",
+                error="Duplicate cfg filenames",
+                reason=f"{', '.join(dupes)} appears more than once.",
+                suggestion="Condor flattens transferred files into one scratch "
+                           "directory, so cfg basenames must be unique even if "
+                           "their source directories differ.",
             )
 
         image, os_tag = _image_for_arch(self.scram_arch)
@@ -498,14 +565,20 @@ class CMSSWJobSubmitTool(BaseTool):
         output_files = list(self.output_files or ["step1.root"])
         transfer_in = list(self.transfer_input_files or [])
 
-        cfg_text = ""
-        try:
-            with open(cfg_path) as fh:
-                cfg_text = fh.read()
-        except OSError as e:  # unreadable cfg is a warning, not a hard stop
-            warnings.append(f"Could not read cfg for path checking: {e}")
-        if cfg_text:
-            warnings.extend(_scan_unreachable_inputs(cfg_text, transfer_in))
+        # Each cfg is scanned; a later step's --filein usually names an
+        # intermediate produced by an earlier step in the same job, which is
+        # a relative name and so never trips the absolute-path check.
+        for cfg_path in cfg_paths:
+            try:
+                with open(cfg_path) as fh:
+                    cfg_text = fh.read()
+            except OSError as e:  # unreadable cfg is a warning, not a hard stop
+                warnings.append(
+                    f"Could not read {os.path.basename(cfg_path)} for path "
+                    f"checking: {e}")
+                continue
+            for finding in _scan_unreachable_inputs(cfg_text, transfer_in):
+                warnings.append(f"{os.path.basename(cfg_path)}: {finding}")
 
         if self.n_jobs > 1 and self.first_seed <= 0:
             warnings.append(
@@ -525,7 +598,7 @@ class CMSSWJobSubmitTool(BaseTool):
         wrapper_name = "run_cmssw.sh" if self.use_condor else "run_cmssw_local.sh"
         wrapper_path = os.path.join(job_dir, wrapper_name)
         wrapper_text = _build_wrapper(
-            cfg_file=cfg_path,
+            cfg_files=cfg_paths,
             cmssw_release=self.cmssw_release,
             scram_arch=self.scram_arch,
             output_files=output_files,
@@ -561,7 +634,7 @@ class CMSSWJobSubmitTool(BaseTool):
                 result["warnings"] = warnings
             return json.dumps(result, indent=2)
 
-        all_inputs = [cfg_path] + transfer_in
+        all_inputs = cfg_paths + transfer_in
         jdl_path = os.path.join(job_dir, "submit.jdl")
         jdl_text = _build_jdl(
             executable=wrapper_name,
@@ -585,7 +658,7 @@ class CMSSWJobSubmitTool(BaseTool):
 
         if self.submit:
             try:
-                completed = subprocess.run(
+                completed = _run_condor_cmd(
                     ["condor_submit", "submit.jdl"],
                     cwd=job_dir, capture_output=True, text=True, timeout=180,
                 )
@@ -613,6 +686,30 @@ class CMSSWJobSubmitTool(BaseTool):
         if warnings:
             result["warnings"] = warnings
         return json.dumps(result, indent=2)
+
+
+def _run_condor_cmd(cmd: List[str], **kwargs) -> subprocess.CompletedProcess:
+    """
+    Run an HTCondor client command, tolerating shebang-less wrapper scripts.
+
+    Some sites (FNAL LPC among them) ship `condor_submit`/`condor_q` as scripts
+    whose FIRST LINE is a shell `exec` rather than a `#!` line, to work around
+    LD_LIBRARY_PATH:
+
+        exec env LD_LIBRARY_PATH='' /usr/bin/python3 -Ex "$0" "$@"
+
+    A shell runs these fine, but execve() rejects them with ENOEXEC ("Exec
+    format error"), so a plain subprocess call fails on a perfectly working
+    installation. Retry through /bin/sh -- passing the script as an argument,
+    not as a shell string, so no argument quoting is involved.
+    """
+    try:
+        return subprocess.run(cmd, **kwargs)
+    except OSError as e:
+        if e.errno != errno.ENOEXEC:
+            raise
+        resolved = shutil.which(cmd[0]) or cmd[0]
+        return subprocess.run(["/bin/sh", resolved] + list(cmd[1:]), **kwargs)
 
 
 _CLUSTER_RE = re.compile(r"submitted to cluster (\d+)")
@@ -681,7 +778,7 @@ class CondorJobStatusTool(BaseTool):
         cmd += [str(self.cluster_id), "-af", "ProcId", "JobStatus", "HoldReason"]
 
         try:
-            completed = subprocess.run(
+            completed = _run_condor_cmd(
                 cmd, capture_output=True, text=True, timeout=120)
         except FileNotFoundError:
             return self.format_error(

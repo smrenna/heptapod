@@ -116,7 +116,10 @@ def test_scan_unreachable_inputs():
         transferred=["/uscms_data/d2/someone/gridpacks/model_tarball.tar.xz"],
     )
     assert len(findings) == 1
-    assert "bare filename" in findings[0]
+    assert "rewrite it" in findings[0]
+    # The old advice ("use a bare filename") is actively wrong -- the helper
+    # cds into lheevent/ before untarring -- so the message must warn against it.
+    assert "Do NOT" in findings[0]
 
     # A cvmfs path is reachable and must not be flagged.
     cvmfs_cfg = "args = cms.vstring('/cvmfs/cms.cern.ch/phys_generator/gp.tar.xz')"
@@ -129,7 +132,7 @@ def test_scan_unreachable_inputs():
 def test_wrapper_seeds_are_per_job():
     """Each job derives its own seed from $1; the patch seeds every RNG module."""
     text = _build_wrapper(
-        cfg_file="/some/where/step1_cfg.py",
+        cfg_files=["/some/where/step1_cfg.py"],
         cmssw_release="CMSSW_12_4_8",
         scram_arch="el8_amd64_gcc10",
         output_files=["step1.root"],
@@ -154,7 +157,7 @@ def test_wrapper_seeds_are_per_job():
 def test_wrapper_eos_stageout_and_threads():
     """output_eos_dir switches to xrdcp; n_threads reaches the cmsRun call."""
     text = _build_wrapper(
-        cfg_file="step1_cfg.py",
+        cfg_files=["step1_cfg.py"],
         cmssw_release="CMSSW_13_0_13",
         scram_arch="el8_amd64_gcc11",
         output_files=["nano.root"],
@@ -162,7 +165,7 @@ def test_wrapper_eos_stageout_and_threads():
         output_eos_dir="root://cmseos.fnal.gov//store/user/me/out/",
         n_threads=4,
     )
-    assert "cmsRun -n 4 job_cfg.py" in text
+    assert "cmsRun -n 4 job_cfg_0.py" in text
     assert 'xrdcp -f "nano_${PROC}.root" ' \
            '"root://cmseos.fnal.gov//store/user/me/out/nano_${PROC}.root"' in text
     print("[OK] test_wrapper_eos_stageout_and_threads")
@@ -171,7 +174,7 @@ def test_wrapper_eos_stageout_and_threads():
 def test_wrapper_local_mode_reuses_release():
     """Local mode fixes the seed and does not rebuild an existing release area."""
     text = _build_wrapper(
-        cfg_file="step1_cfg.py",
+        cfg_files=["step1_cfg.py"],
         cmssw_release="CMSSW_12_4_8",
         scram_arch="el8_amd64_gcc10",
         output_files=["step1.root"],
@@ -181,6 +184,87 @@ def test_wrapper_local_mode_reuses_release():
     assert "PROC=0" in text
     assert "if [ ! -d CMSSW_12_4_8 ]; then cmsrel CMSSW_12_4_8; fi" in text
     print("[OK] test_wrapper_local_mode_reuses_release")
+
+
+def test_wrapper_runs_multiple_cfgs_in_order():
+    """Chained steps share one release setup and keep intermediates on scratch."""
+    text = _build_wrapper(
+        cfg_files=["/a/digi_cfg.py", "/b/reco_cfg.py"],
+        cmssw_release="CMSSW_12_4_11_patch3",
+        scram_arch="el8_amd64_gcc10",
+        output_files=["aod.root"],
+        first_seed=500,
+    )
+    # Release is set up once, not once per step.
+    assert text.count("cmsrel CMSSW_12_4_11_patch3") == 1
+    # Both steps run, in the order given, each from its own seeded copy.
+    assert text.index("cp digi_cfg.py job_cfg_0.py") < \
+           text.index("cp reco_cfg.py job_cfg_1.py")
+    assert text.index("cmsRun job_cfg_0.py") < text.index("cmsRun job_cfg_1.py")
+    assert text.count("HEPTAPOD_SEED_PATCH") == 4        # 2 per step
+    # Only the declared output is renamed for transfer; nothing else leaves.
+    assert 'mv "aod.root" "aod_${PROC}.root"' in text
+    assert "job_cfg_0.py\"" not in text.split("mv ")[-1]
+    print("[OK] test_wrapper_runs_multiple_cfgs_in_order")
+
+
+def test_job_patch_rewrites_gridpack_path():
+    """ExternalLHEProducer args must be absolute at run time, not relative."""
+    text = _build_wrapper(
+        cfg_files=["gen_cfg.py"],
+        cmssw_release="CMSSW_12_4_11_patch3",
+        scram_arch="el8_amd64_gcc10",
+        output_files=["gs.root"],
+        first_seed=1000,
+    )
+    assert "externalLHEProducer" in text
+    assert "os.path.abspath" in text
+
+    # Execute the patch against a stand-in process to prove the behaviour:
+    # a transferred tarball becomes absolute, a /cvmfs path is left alone.
+    import os as _os, tempfile, types
+    start = text.index("<<'HEPTAPOD_SEED_PATCH'") + len("<<'HEPTAPOD_SEED_PATCH'")
+    patch = text[start:text.index("HEPTAPOD_SEED_PATCH", start)]
+
+    # The patch imports FWCore for real; stand in for it so the patch text can
+    # be executed verbatim here rather than being edited for the test.
+    class _VStr(list):
+        def __init__(self, *a): super().__init__(a)
+    _cms = types.SimpleNamespace(
+        vstring=_VStr, untracked=types.SimpleNamespace(uint32=int))
+    _fwcore = types.ModuleType("FWCore")
+    _ps = types.ModuleType("FWCore.ParameterSet")
+    _cfgmod = types.ModuleType("FWCore.ParameterSet.Config")
+    _cfgmod.vstring = _VStr
+    _cfgmod.untracked = _cms.untracked
+    sys.modules.update({"FWCore": _fwcore, "FWCore.ParameterSet": _ps,
+                        "FWCore.ParameterSet.Config": _cfgmod})
+
+    class _Obj: pass
+
+    with tempfile.TemporaryDirectory() as d:
+        cwd = _os.getcwd()
+        _os.chdir(d)
+        try:
+            open("gp.tar.xz", "w").write("x")     # the transferred gridpack
+            proc = _Obj()
+            proc.externalLHEProducer = _Obj()
+            proc.externalLHEProducer.args = [
+                "/login/node/only/gp.tar.xz",      # transferred -> rewritten
+                "/cvmfs/cms.cern.ch/other.tar.xz", # real cvmfs -> untouched
+            ]
+            env = {"os": _os, "process": proc}
+            _os.environ["HEPTAPOD_SEED"] = "1234"
+            exec(compile(patch, "patch", "exec"), env)
+            out = list(proc.externalLHEProducer.args)
+        finally:
+            _os.chdir(cwd)
+
+    assert out[0] == _os.path.join(_os.path.realpath(d), "gp.tar.xz") or \
+           out[0].endswith("/gp.tar.xz"), out[0]
+    assert _os.path.isabs(out[0])
+    assert out[1] == "/cvmfs/cms.cern.ch/other.tar.xz"      # untouched
+    print("[OK] test_job_patch_rewrites_gridpack_path")
 
 
 def test_jdl_always_sets_transfer_output_files():
@@ -229,6 +313,53 @@ def test_jdl_always_sets_transfer_output_files():
     print("[OK] test_jdl_always_sets_transfer_output_files")
 
 
+def test_run_condor_cmd_retries_on_enoexec():
+    """Sites ship condor_submit as a shebang-less script; execve rejects it."""
+    import errno as _errno
+    calls = []
+
+    class _Completed:
+        returncode = 0
+        stdout = "1 job(s) submitted to cluster 42."
+        stderr = ""
+
+    def fake_run(cmd, **kw):
+        calls.append(list(cmd))
+        if len(calls) == 1:                      # first, direct attempt
+            raise OSError(_errno.ENOEXEC, "Exec format error", cmd[0])
+        return _Completed()
+
+    original = mod.subprocess.run
+    mod.subprocess.run = fake_run
+    try:
+        result = mod._run_condor_cmd(["condor_submit", "submit.jdl"])
+    finally:
+        mod.subprocess.run = original
+
+    assert result.returncode == 0
+    assert len(calls) == 2
+    assert calls[0] == ["condor_submit", "submit.jdl"]
+    # Retried via /bin/sh, with the script passed as an ARGUMENT (no shell
+    # string), so nothing is re-quoted or word-split.
+    assert calls[1][0] == "/bin/sh"
+    assert calls[1][-1] == "submit.jdl"
+
+    # A different OSError must NOT be swallowed.
+    def fake_enoent(cmd, **kw):
+        raise OSError(_errno.ENOENT, "No such file", cmd[0])
+    mod.subprocess.run = fake_enoent
+    try:
+        raised = False
+        try:
+            mod._run_condor_cmd(["condor_submit"])
+        except OSError:
+            raised = True
+        assert raised, "ENOENT should propagate, not be retried"
+    finally:
+        mod.subprocess.run = original
+    print("[OK] test_run_condor_cmd_retries_on_enoexec")
+
+
 def test_parse_cluster_id():
     assert _parse_cluster_id("1 job(s) submitted to cluster 30052257.") == "30052257"
     assert _parse_cluster_id("nothing useful") is None
@@ -263,6 +394,80 @@ def test_tool_defaults_to_condor(tmp_path: Path):
     assert os.access(result["written"]["wrapper"], os.X_OK)
     assert "condor_submit submit.jdl" in result["submit_command"]
     print("[OK] test_tool_defaults_to_condor")
+
+
+def test_tool_accepts_cfg_files_list(tmp_path: Path):
+    """cfg_files chains steps in one job; all cfgs are transferred in."""
+    digi = _write_cfg(tmp_path, name="digi_cfg.py")
+    reco = _write_cfg(tmp_path, name="reco_cfg.py")
+    tool = CMSSWJobSubmitTool(base_directory=str(tmp_path))
+    result = json.loads(tool.execute(
+        cfg_files=[str(digi), str(reco)],
+        cmssw_release="CMSSW_12_4_11_patch3",
+        scram_arch="el8_amd64_gcc10",
+        output_files=["aod.root"],
+        allow_nonshared_submit_dir=True,
+    ))
+
+    assert result["status"] == "ok"
+    jdl = Path(result["written"]["jdl"]).read_text()
+    assert "digi_cfg.py" in jdl and "reco_cfg.py" in jdl
+    # The intermediate is produced and consumed inside the job, so it must not
+    # be transferred back -- only the declared output is.
+    assert "transfer_output_files   = aod_$(Process).root" in jdl
+
+    wrapper = Path(result["written"]["wrapper"]).read_text()
+    assert wrapper.index("cmsRun job_cfg_0.py") < wrapper.index("cmsRun job_cfg_1.py")
+    print("[OK] test_tool_accepts_cfg_files_list")
+
+
+def test_tool_cfg_file_is_single_element_alias(tmp_path: Path):
+    """The original single-cfg field keeps working unchanged."""
+    cfg = _write_cfg(tmp_path)
+    tool = CMSSWJobSubmitTool(base_directory=str(tmp_path))
+    single = json.loads(tool.execute(
+        cfg_file=str(cfg), cmssw_release="CMSSW_12_4_8",
+        scram_arch="el8_amd64_gcc10", allow_nonshared_submit_dir=True))
+    listed = json.loads(tool.execute(
+        cfg_files=[str(cfg)], cmssw_release="CMSSW_12_4_8",
+        scram_arch="el8_amd64_gcc10", allow_nonshared_submit_dir=True))
+
+    assert single["status"] == listed["status"] == "ok"
+    assert Path(single["written"]["wrapper"]).read_text() == \
+           Path(listed["written"]["wrapper"]).read_text()
+    print("[OK] test_tool_cfg_file_is_single_element_alias")
+
+
+def test_tool_rejects_duplicate_cfg_basenames(tmp_path: Path):
+    """Condor flattens transfers, so same-named cfgs would clobber each other."""
+    sub_a = tmp_path / "a"; sub_a.mkdir()
+    sub_b = tmp_path / "b"; sub_b.mkdir()
+    _write_cfg(sub_a, name="step_cfg.py")
+    _write_cfg(sub_b, name="step_cfg.py")
+
+    tool = CMSSWJobSubmitTool(base_directory=str(tmp_path))
+    out = tool.execute(
+        cfg_files=[str(sub_a / "step_cfg.py"), str(sub_b / "step_cfg.py")],
+        cmssw_release="CMSSW_12_4_8", scram_arch="el8_amd64_gcc10",
+        allow_nonshared_submit_dir=True)
+    assert out.startswith("Error:") and "Duplicate cfg filenames" in out
+    print("[OK] test_tool_rejects_duplicate_cfg_basenames")
+
+
+def test_tool_scans_every_cfg_for_unreachable_paths(tmp_path: Path):
+    """A bad path in the SECOND cfg is caught too, and attributed to it."""
+    good = _write_cfg(tmp_path, CFG_CLEAN, name="first_cfg.py")
+    bad = _write_cfg(tmp_path, CFG_WITH_LOCAL_GRIDPACK, name="second_cfg.py")
+    tool = CMSSWJobSubmitTool(base_directory=str(tmp_path))
+    result = json.loads(tool.execute(
+        cfg_files=[str(good), str(bad)],
+        cmssw_release="CMSSW_12_4_8", scram_arch="el8_amd64_gcc10",
+        allow_nonshared_submit_dir=True))
+
+    joined = " ".join(result["warnings"])
+    assert "second_cfg.py:" in joined
+    assert "model_tarball.tar.xz" in joined
+    print("[OK] test_tool_scans_every_cfg_for_unreachable_paths")
 
 
 def test_tool_local_mode_writes_no_jdl(tmp_path: Path):
@@ -508,11 +713,18 @@ def main():
         test_wrapper_seeds_are_per_job,
         test_wrapper_eos_stageout_and_threads,
         test_wrapper_local_mode_reuses_release,
+        test_wrapper_runs_multiple_cfgs_in_order,
+        test_job_patch_rewrites_gridpack_path,
         test_jdl_always_sets_transfer_output_files,
         test_parse_cluster_id,
+        test_run_condor_cmd_retries_on_enoexec,
     ]
     tmp_tests = [
         test_tool_defaults_to_condor,
+        test_tool_accepts_cfg_files_list,
+        test_tool_cfg_file_is_single_element_alias,
+        test_tool_rejects_duplicate_cfg_basenames,
+        test_tool_scans_every_cfg_for_unreachable_paths,
         test_tool_local_mode_writes_no_jdl,
         test_tool_warns_about_unreachable_gridpack,
         test_tool_rejects_bad_inputs,
