@@ -148,8 +148,7 @@ needs to differ, or downstream merging sees duplicate lumi IDs.
 For modest files (our NanoAODv12 was 3 MB, GEN-SIM 113 MB per 100 events),
 plain `transfer_output_files` back to the submit directory is simplest.
 
-For anything larger, write to EOS from inside the job. **Verified working with
-a plain grid proxy — no VOMS extension needed** for LPC EOS:
+For anything larger, write to EOS from inside the job:
 
 ```bash
 xrdcp -f out_${PROC}.root root://cmseos.fnal.gov//store/user/$USER/<dir>/out_${PROC}.root
@@ -158,9 +157,43 @@ xrdcp -f out_${PROC}.root root://cmseos.fnal.gov//store/user/$USER/<dir>/out_${P
 Read back interactively with `xrdfs root://cmseos.fnal.gov ls -l /store/user/...`,
 or POSIX via `/eos/uscms/store/user/...` from the login node (not from a job).
 
-Watch the proxy lifetime: a proxy with 11 hours left will strand jobs that sit
-idle overnight. `voms-proxy-init -rfc -voms cms -valid 192:00` before a large
-submission.
+### Two kinds of proxy, and a trap between them
+
+Writing to *your own* LPC EOS area works with a **plain grid proxy** — no VOMS
+extension — because that endpoint authorizes on the certificate DN alone.
+Verified.
+
+Do not generalize that. Reading CMS **central data** over xrootd
+(`/store/mc/...`, e.g. the premix pileup library a DIGI step needs) authorizes
+on **CMS VO membership**, and a proxy without VOMS attributes is rejected:
+
+```
+[FATAL] Auth failed
+Failed to open the file 'root://cmsxrootd.fnal.gov//store/mc/.../PREMIX/...root'
+----- Begin Fatal Exception ----- ... class=PreMixingModule label='mixData'
+```
+
+The trap is that the EOS check passes, so the proxy looks fine right up until
+a premix job dies eight minutes in. Distinguish the two cases before
+submitting a long chain:
+
+```bash
+voms-proxy-info -all | grep -E "^VO|attribute"     # want: VO : cms
+# and a direct read of what the job will actually open:
+xrdfs root://cmsxrootd.fnal.gov stat /store/mc/<the premix file>
+```
+
+`voms-proxy-init` needs a TTY for the passphrase, so it cannot be driven from
+a non-interactive agent session — run it yourself:
+
+```bash
+voms-proxy-init -rfc -voms cms -valid 192:00
+```
+
+Note it writes to `$X509_USER_PROXY` when that is set and `/tmp/x509up_u<uid>`
+otherwise, so a proxy made in one shell may not be where another shell looks;
+pass `-out <path>` to pin it. Watch the lifetime too — a proxy with hours left
+will strand jobs that sit idle overnight.
 
 ## Splitting a full production chain
 

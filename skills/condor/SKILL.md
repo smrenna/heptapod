@@ -104,8 +104,13 @@ negligible. Therefore:
    reachability warnings — they are the commonest batch-only failure.
 3. **Is the arch right?** `scram_arch` must be the one the release was built
    for, and must match the gridpack's (pitfall P6 in the `cmssw` skill).
-4. **Is there a proxy, with enough life?** Needed for premix pileup and EOS
-   stage-out. A proxy with hours left strands jobs that sit idle overnight:
+4. **Is there a proxy, of the right kind, with enough life?** A plain grid
+   proxy is enough to write your own EOS area but is **rejected** for reading
+   CMS central data such as the premix pileup library, which needs VOMS
+   attributes. Check `voms-proxy-info -all | grep ^VO` shows `cms`, not just
+   that a proxy exists — the EOS test passes either way, so the failure only
+   appears once a premix job is eight minutes in. `voms-proxy-init` needs a
+   TTY, so it cannot be run from an agent session:
    `voms-proxy-init -rfc -voms cms -valid 192:00`.
 5. **Where does output go?** Small outputs come back through the schedd;
    anything large should `xrdcp` to EOS via `output_eos_dir`, which also
