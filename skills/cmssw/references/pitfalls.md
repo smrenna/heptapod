@@ -156,6 +156,66 @@ output is `.cmnd`-syntax Pythia8 commands (the same syntax CMSSW's
 than a bare `.cmnd` file). Paste the lines directly into
 `processParameters = cms.vstring(...)`.
 
+### The corpus pattern: declare the particle, then its channels
+
+A decay table alone assumes Pythia8 already has correct properties for the
+code. When the state arrives via `QNUMBERS` (P5) those properties are minimal
+— no width, no Breit-Wigner range, no lifetime — so the convention in central
+fragments is to declare the particle **in full** and then attach channels.
+Schematically, for a colour-triplet scalar `Xs` of charge −1/3 and mass
+1000 GeV decaying to `u e⁻`:
+
+```python
+processParameters = cms.vstring(
+    '9000001:all = Xs Xs~ 1 -1 3 1000.0 2.0 970.0 1030.0 9.86635e-14',
+    '9000001:oneChannel = 2 1.0 101 2 11',      # -> u  e-
+    '9000001:addChannel = 3 1.0 101 -2 -11',    # -> u~ e+
+    '9000001:mayDecay = on',
+    '9000001:isResonance = on',
+),
+```
+
+`id:all` takes, in order:
+
+```
+name antiName spinType chargeType colType m0 mWidth mMin mMax tau0
+```
+
+- `spinType` = 2S+1 — `1` scalar, `2` fermion, `3` vector.
+- `chargeType` = charge in units of *e/3*, so `-1` above is charge −1/3 and a
+  charge −4/3 state would be `-4`. Getting this wrong is the same silent
+  failure class as P5.
+- `colType` — `0` singlet, `3` triplet, `-3` antitriplet, `8` octet.
+- `mMin`/`mMax` truncate the Breit-Wigner. The corpus convention is
+  `m0 ∓ 15·mWidth` — above, `1000 ∓ 15·2.0`.
+- `tau0` is the proper lifetime **in mm**, i.e. `ħc / Γ` with
+  `ħc = 1.97327e-13 mm·GeV`. Check it: `1.97327e-13 / 2.0 = 9.86635e-14` ✓.
+
+Pick the PDG code by the `feynrules` skill's rule — 9000001 upward — so it
+cannot collide with an SM particle (P5).
+
+`oneChannel`/`addChannel` take `onMode bRatio meMode products...`:
+`onMode` `1` = on, `2` = particle only, `3` = antiparticle only; `meMode`
+`101` = pure phase space. Use `oneChannel` for the **first** channel — it
+wipes any existing table — and `addChannel` for each one after.
+
+Because four of these fields move with the mass, mass scans are *generated*
+rather than hand-written. The convention is a small producer script kept next
+to a template fragment, which regex-replaces the `:all` line per mass point
+and writes one fragment per mass, from a table of (mass, width). Copy that
+approach rather than editing twenty fragments by hand — and note it means the
+committed fragment for any single mass point is generated output, so fix bugs
+in the producer, not in the fragments.
+
+**Also worth stealing**: when the sample is only meaningful with the state
+present, the convention is to append a `PythiaFilter` to the production
+sequence rather than cutting in the run card —
+
+```python
+bsmFilter = cms.EDFilter("PythiaFilter", ParticleID = cms.untracked.int32(9000001))
+ProductionFilterSequence = cms.Sequence(generator * bsmFilter)
+```
+
 ## P5 — Pythia8 learns your BSM particles from the LHE's QNUMBERS blocks — and silently ignores one whose PDG code collides with the SM
 
 Pythia8 has no knowledge of your UFO model. It learns new states from
@@ -247,3 +307,74 @@ and still leaves a small non-empty output file, so `[ -s output.root ]` and
 "grep for Fatal Exception" both report success on a crashed job. If you wrap
 these steps in a script, gate on a completed `TimeReport> Time report complete`
 plus a plausible file size, and grep for `segmentation violation` too.
+
+## P8 — The fragment's boilerplate is campaign-specific, and the wrong tune module imports cleanly
+
+Three lines of a GEN fragment look like inert boilerplate and are not: the
+hadronizer class, the CP5 tune import, and the PS-weights block. Copying them
+from an older fragment (or from this skill's template without adjusting) gives
+you a job that runs to completion with the wrong shower settings — no error,
+no warning.
+
+Counts over the ~224 fragments in `cms-gen/genproductions_cards`:
+
+| line | Run 2 @ 13 TeV | Run 3 @ 13.6 TeV |
+|---|---|---|
+| tune import | `Configuration.Generator.MCTunes2017.PythiaCP5Settings_cfi` (73) | `Configuration.Generator.MCTunesRun3ECM13p6TeV.PythiaCP5Settings_cfi` (237) |
+| `comEnergy` | `13000.` | `13600.` |
+| run card `ebeam1/2` | `6500` | `6800` |
+
+Two module paths deserve specific warning because they are plausible and
+wrong: `MCTunesRun3.PythiaCP5Settings_cfi` (no `ECM13p6TeV`) does not exist,
+and the 13.6 TeV CP5 block is **not** a drop-in for the 2017 one — the tune
+is retuned for the higher energy.
+
+The hadronizer class is a separate axis: **`Pythia8ConcurrentHadronizerFilter`**
+is the current default (209 of 224), with the legacy single-threaded
+`Pythia8HadronizerFilter` in the remaining 15. The concurrent variant is what
+you want for anything multithreaded; if a job unexpectedly needs the
+`--apply_many_threads_patch` argument to `request_fragment_check.py`, an
+unconverted hadronizer is the usual reason.
+
+Finally, `pythia8PSweightsSettingsBlock` (from
+`Configuration.Generator.PSweightsPythia.PythiaPSweightsSettings_cfi`) appears
+in 283 fragments and carries the parton-shower scale-variation weights. It is
+optional for a private study and expected for anything headed toward central
+production — but note it must be added in **both** places, the `PSet` and the
+`parameterSets` vstring, and an entry named in `parameterSets` without a
+matching block is its own failure mode (cf. P7's inverse).
+
+## P9 — `lhaid` in a Run 3 run card should be the `$DEFAULT_PDF_SETS` placeholder, not a number
+
+261 of the 266 Run 3 run cards in the card corpus contain
+
+```
+ $DEFAULT_PDF_SETS = lhaid          ! if pdlabel=lhapdf, this is the lhapdf number
+ $DEFAULT_PDF_MEMBERS = reweight_PDF
+```
+
+rather than a literal LHAPDF id. This is not a templating artifact left in by
+mistake — `gridpack_generation.sh` substitutes it, in
+`Utilities/gridpack_helpers.sh`:
+
+```bash
+if grep -q -e "\$DEFAULT_PDF_SETS" $CARDSDIR/${name}_run_card.dat; then
+    local central_set=$(python3 ${script_dir}/getMG5_aMC_PDFInputs.py -f "central" -c run3 $pdfExtraArgs)
+    sed "s/\$DEFAULT_PDF_SETS/${central_set}/g" $CARDSDIR/${name}_run_card.dat > ./Cards/run_card.dat
+```
+
+The value comes from `MetaData/pdflist_{4f,5f}_run3.dat` — first line wins, so
+currently **325300** (`NNPDF31_nnlo_as_0118_mc_hessian`) for 5-flavour and
+**325500** (`NNPDF31_nnlo_as_0118_nf_4_mc_hessian`) for 4-flavour. The
+`--is5FlavorScheme` switch is derived by the script from your process, which
+is the point: hardcoding the number pins you to today's recommendation and
+silently decouples you from the campaign default, *and* can pick the wrong
+flavour scheme.
+
+Omitting the placeholder is not an error — the script prints a `WARNING:
+You've chosen not to use the PDF sets recommended for run3 production!` and
+copies your card through unchanged. Easy to miss in a long build log.
+
+**Fix**: use the placeholder unless you have a specific reason to pin a PDF,
+and keep `$DEFAULT_PDF_MEMBERS = reweight_PDF` with it (the script strips that
+line after substitution).

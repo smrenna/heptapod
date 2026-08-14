@@ -1,7 +1,7 @@
 ---
 name: cmssw
 bundle: mg5
-description: Take a UFO model from a validated MG5 process to CMSSW-showered events — build a MadGraph gridpack with CMS genproductions, shower it inside CMSSW with Pythia8, and validate the output. Use whenever the user mentions gridpacks, genproductions, gridpack_generation.sh, ExternalLHEProducer, cmsDriver.py, GEN-SIM, NanoGEN, Pythia8HadronizerFilter, or running a private/BSM UFO model through the CMS production chain. Also use proactively before writing a CMSSW GEN fragment for a non-stock model — the tutorial path (network-fetched models, cvmfs tarball, SM Rivet routines) silently doesn't generalize to a private UFO model.
+description: Take a UFO model from a validated MG5 process to CMSSW-showered events — build a MadGraph gridpack with CMS genproductions, shower it inside CMSSW with Pythia8, and validate the output. Use whenever the user mentions gridpacks, genproductions, genproductions_cards, gridpack_generation.sh, ExternalLHEProducer, cmsDriver.py, GEN-SIM, NanoGEN, Pythia8HadronizerFilter/Pythia8ConcurrentHadronizerFilter, proc/run/customize/extramodels cards, submitting cmsRun to HTCondor/condor_submit/LPC batch, or running a private/BSM UFO model through the CMS production chain. Also use proactively before writing a CMSSW GEN fragment for a non-stock model, or before concluding that a model or process must be built from scratch — the tutorial path (network-fetched models, cvmfs tarball, SM Rivet routines) silently doesn't generalize to a private UFO model, and the central card corpus often already has the process.
 ---
 
 # UFO → gridpack → CMSSW: showering a private model in the CMS chain
@@ -36,6 +36,31 @@ the MG5 process itself right (decay chains, widths, `NP=N`) before it goes
 into a gridpack, see the `mg5` skill — do that validation *first*, ideally
 with `ValidateProcessTool` or a small interactive `launch`, since a gridpack
 build is much more expensive to redo than a MG5 shell session.
+
+## Step zero: search the card corpus
+
+Before building anything — and *especially* before concluding that a model
+must be built from scratch — search
+[`cms-gen/genproductions_cards`](https://gitlab.cern.ch/cms-gen/genproductions_cards),
+the repository of merged production cards and GEN fragments. It answers two
+questions cheaply:
+
+1. **Does this process already exist?** ~100 MadGraph process directories at
+   13.6 TeV alone, each a validated proc/run/customize card set, often with a
+   matching hadronizer fragment under `genfragments/`.
+2. **Is the model already published?** `_extramodels.dat` entries name UFO
+   archives hosted in the CMS generators web area, which makes pitfall 1's
+   whole local-path workaround unnecessary.
+
+```bash
+ls MadGraph5_aMCatNLO/production/13p6TeV/ | grep -i <process>
+cat $(find . -name "*_extramodels.dat") | sort -u        # every published model in use
+```
+
+The corpus is also where campaign conventions are *checked* rather than
+recalled — beam energy, tune module, hadronizer class, PDF handling. Details,
+search recipes, and the standing caveat that the corpus records deprecated
+patterns alongside current ones are in `references/card_corpus.md`.
 
 ## Three things the tutorial's stock-model path hides
 
@@ -145,6 +170,9 @@ usually no matching published routine. Pick one:
 
 ## Before building a gridpack
 
+0. **Has someone already carded this?** Step zero above. Also check whether
+   the UFO is already published to the CMS generators area, which decides
+   item 2 below for you.
 1. **Does the process run cleanly by hand first?** A gridpack build repeats
    the full diagram generation + integration-grid setup with no interactive
    feedback loop — debug the process interactively (`mg5` skill) before
@@ -170,6 +198,16 @@ usually no matching published routine. Pick one:
    analyses, heptapod's own LHE analysis chain, or a custom routine (pitfall
    3)? Decide before running the full CMSSW chain, since that's the expensive
    step to repeat.
+7. **Which campaign is this?** The fragment's hadronizer class, CP5 tune
+   import, `comEnergy`, and the run card's `ebeam1/2` all have different Run 2
+   and Run 3 values, and the wrong tune module imports without complaint
+   (pitfall P8). Leave `lhaid` as the `$DEFAULT_PDF_SETS` placeholder unless
+   you mean to pin a PDF (P9).
+8. **Interactive or batch?** Anything past a few hundred events wants
+   HTCondor — GEN-SIM dominates and splits cleanly by seed. Note the job sees
+   *none* of your work area, so the gridpack and cfg have to be transferred or
+   staged on cvmfs, and per-job random seeds have to be set explicitly or every
+   job regenerates identical events. See `references/condor.md`.
 
 ## Running
 
@@ -236,9 +274,19 @@ rivet-mkhtml --mc-errs *.yoda   # only if a matching routine exists
   `gridpack_generation.sh` code quoted: `_extramodels.dat` being network-only
   and the two workarounds, the misleadingly-named tarball scripts (`_cvmfs` is
   the local-path one), MLM jet-matching double-counting when adding extra
-  partons at LO, stable BSM states surviving the LHE, `QNUMBERS` blocks and
-  silently-ignored colliding PDG codes, SCRAM_ARCH/genproductions-MG5-version
-  mismatches, and the empty-`processParameters` segfault.
+  partons at LO, stable BSM states surviving the LHE and how central fragments
+  declare a BSM resonance, `QNUMBERS` blocks and silently-ignored colliding
+  PDG codes, SCRAM_ARCH/genproductions-MG5-version mismatches, the
+  empty-`processParameters` segfault, campaign-specific fragment boilerplate,
+  and the `$DEFAULT_PDF_SETS` placeholder.
+- **`references/condor.md`** — running `cmsRun` on HTCondor: what the worker
+  node actually has (no `/uscms_data`, no `$HOME`, `/cvmfs` and a proxy yes),
+  the EL8 image ClassAd, per-job seeding, output via transfer or `xrdcp` to
+  EOS, and a probe job for re-verifying all of it at another site.
+- **`references/card_corpus.md`** — how to search `cms-gen/genproductions_cards`
+  for an existing card set, an already-published UFO, or the real distribution
+  of a campaign convention; plus why counting patterns in the tree beats
+  trusting any written rule list, including that repo's own.
 - **`references/proc_card_template.dat`** — a minimal genproductions-style
   proc card (no `launch`; `import model`/`generate`/`output` only), with all
   three `import model` cases from pitfall 1 spelled out.
