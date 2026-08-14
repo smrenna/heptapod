@@ -313,7 +313,7 @@ def main():
     )
     parser.add_argument(
         "--only",
-        choices=["prereqs", "conversions", "kinematics", "reconstruction", "delta_r_filter", "feynrules", "mg5", "pythia", "sherpa", "llm", "pdg", "inspire", "units", "nda", "eda", "feyngraph", "logging", "central_production"],
+        choices=["prereqs", "conversions", "kinematics", "reconstruction", "delta_r_filter", "feynrules", "mg5", "pythia", "sherpa", "llm", "pdg", "inspire", "units", "nda", "eda", "feyngraph", "logging", "central_production", "condor"],
         help="Run only tests for specified component (prereqs = prerequisites check only)"
     )
     parser.add_argument(
@@ -394,6 +394,10 @@ def main():
         "central_production": {
             "script": REPO_ROOT / "tools" / "central_production" / "test_mcm_chain.py",
             "description": "Central-production McM chain resolution (get_setup parsing, chain walking)"
+        },
+        "condor": {
+            "script": REPO_ROOT / "tools" / "condor" / "test_cmssw_condor.py",
+            "description": "HTCondor batch submission for cmsRun (JDL/wrapper generation, seeding, reachability checks)"
         },
         "nda": {
             "scripts": [

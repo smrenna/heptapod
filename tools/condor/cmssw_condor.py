@@ -1,0 +1,756 @@
+"""
+# cmssw_condor.py is a part of the HEPTAPOD package.
+# Copyright (C) 2025 HEPTAPOD authors (see AUTHORS for details).
+# HEPTAPOD is licensed under the GNU GPL v3 or later, see LICENSE for details.
+# Please respect the MCnet Guidelines, see GUIDELINES for details.
+
+Prepare (and optionally submit) a CMSSW `cmsRun` job as an HTCondor cluster.
+
+Batch is the default execution mode for CMSSW work: `use_condor` defaults to
+True, and setting it False emits an equivalent local run script instead. See
+skills/condor/SKILL.md for the procedure and the measured facts about the
+worker-node environment this encodes.
+
+The static checks here exist because the corresponding failures are silent or
+badly misreported at run time:
+
+  * a submit directory the *schedd* cannot read fails as a missing-file error;
+  * an input path under /uscms_data, $HOME or POSIX EOS does not exist on the
+    worker at all, because the job runs in an apptainer container started with
+    --contain;
+  * an unseeded multi-job cluster produces N identical copies of the same
+    events and never errors.
+"""
+
+import json
+import os
+import re
+import shlex
+import subprocess
+from typing import Any, Dict, List, Optional, Tuple
+
+from orchestral.tools.base.tool import BaseTool
+from orchestral.tools.base.field_utils import RuntimeField, StateField
+
+SCHEMA_VERSION = "cmssw-condor-1.0"
+
+# SCRAM_ARCH prefix -> (apptainer image, human-readable OS). The image is what
+# puts the matching libc/libssl in front of the release; getting it wrong is
+# the batch-side form of the EL8-on-EL9 failure documented in
+# skills/central-production/SKILL.md.
+_ARCH_IMAGE_MAP: Dict[str, Tuple[str, str]] = {
+    "slc7": ("/cvmfs/singularity.opensciencegrid.org/cmssw/cms:rhel7", "EL7"),
+    "el8": ("/cvmfs/singularity.opensciencegrid.org/cmssw/cms:rhel8", "EL8"),
+    "el9": ("/cvmfs/singularity.opensciencegrid.org/cmssw/cms:rhel9", "EL9"),
+}
+
+# Filesystems local to the login node. The schedd runs on a different host, so
+# a submit directory here cannot be read at submission time.
+_NONSHARED_PREFIXES = ("/tmp/", "/var/tmp/", "/dev/shm/", "/scratch/")
+
+# Visible from the login node, absent inside the job's container.
+_WORKER_INVISIBLE_PREFIXES = (
+    "/uscms_data/", "/uscms/home/", "/uscms/homes/", "/eos/uscms/", "/afs/",
+)
+
+# Absolute paths appearing in a cfg or fragment. Deliberately loose: it only
+# feeds a reachability warning, so a false positive costs a sentence.
+_ABS_PATH_RE = re.compile(r"['\"](/[^'\"\s]+)['\"]")
+
+_DEFAULT_SEED = 1000
+
+
+# ====================================================================== #
+# ========================= Helper functions =========================== #
+# ====================================================================== #
+
+def _image_for_arch(scram_arch: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Map a SCRAM_ARCH to its apptainer image, e.g. el8_amd64_gcc10 -> cms:rhel8.
+
+    Returns (image, os_tag), or (None, None) for an unrecognized arch -- the
+    caller reports that rather than guessing, since a wrong image produces
+    missing-library errors that do not name the image.
+    """
+    if not scram_arch:
+        return None, None
+    prefix = scram_arch.split("_", 1)[0]
+    image, os_tag = _ARCH_IMAGE_MAP.get(prefix, (None, None))
+    return image, os_tag
+
+
+def _check_submit_dir(job_dir: str) -> Optional[str]:
+    """
+    Reject a submit directory the schedd cannot read.
+
+    HTCondor submission at a typical CMS site is load-balanced across schedd
+    hosts distinct from the interactive node, so `transfer_input_files` is
+    read by the schedd, not by your shell. A path under /tmp then fails with
+    "(errno 2) No such file or directory", which reads as a missing file.
+    """
+    resolved = os.path.abspath(job_dir)
+    for prefix in _NONSHARED_PREFIXES:
+        if resolved == prefix.rstrip("/") or resolved.startswith(prefix):
+            return (
+                f"Submit directory {resolved!r} is on a filesystem local to this "
+                "node. The schedd runs on a different host and reads "
+                "transfer_input_files itself, so submission fails there with a "
+                "misleading '(errno 2) No such file or directory'. Use a shared "
+                "filesystem (e.g. your /uscms_data or home area)."
+            )
+    return None
+
+
+def _scan_unreachable_inputs(
+    cfg_text: str,
+    transferred: List[str],
+) -> List[str]:
+    """
+    Find absolute paths in a cfg that the worker node will not be able to open.
+
+    The job runs under `apptainer --contain` with only /cvmfs, /etc/hosts and
+    /etc/grid-security bound, so /uscms_data, $HOME and POSIX /eos/uscms are
+    absent. Such a path is fine only if it is also transferred in, in which
+    case the cfg should refer to its basename.
+    """
+    transferred_basenames = {os.path.basename(p) for p in transferred}
+    findings: List[str] = []
+    for match in sorted(set(_ABS_PATH_RE.findall(cfg_text))):
+        if not match.startswith(_WORKER_INVISIBLE_PREFIXES):
+            continue
+        if os.path.basename(match) in transferred_basenames:
+            findings.append(
+                f"{match} is transferred in, but the cfg refers to it by "
+                "absolute path -- the worker sees it as "
+                f"./{os.path.basename(match)} in the job's scratch dir. "
+                "Change the cfg to the bare filename."
+            )
+        else:
+            findings.append(
+                f"{match} does not exist on the worker node (the job runs in a "
+                "--contain'd container; /uscms_data, $HOME and POSIX EOS are "
+                "not bound). Add it to transfer_input_files, stage it on "
+                "/cvmfs, or read it over xrootd."
+            )
+    return findings
+
+
+def _build_seed_patch() -> str:
+    """
+    Python appended to the cfg inside the job to make each job's events unique.
+
+    Seeds every module registered with RandomNumberGeneratorService rather than
+    naming `generator`/`externalLHEProducer` explicitly, so it stays correct
+    across cfgs with different module sets. Without this, `queue N` yields N
+    identical copies of the same events with no error anywhere.
+    """
+    return '''
+# --- per-job seeding injected by heptapod CMSSWJobSubmitTool ---
+import FWCore.ParameterSet.Config as cms
+_seed = int(os.environ["HEPTAPOD_SEED"])
+if hasattr(process, "RandomNumberGeneratorService"):
+    _rng = process.RandomNumberGeneratorService
+    for _name in _rng.parameterNames_():
+        _mod = getattr(_rng, _name)
+        if hasattr(_mod, "initialSeed"):
+            _mod.initialSeed = cms.untracked.uint32(_seed)
+if hasattr(process, "source") and hasattr(process.source, "firstLuminosityBlock"):
+    process.source.firstLuminosityBlock = cms.untracked.uint32(_seed)
+'''
+
+
+def _build_wrapper(
+    cfg_file: str,
+    cmssw_release: str,
+    scram_arch: str,
+    output_files: List[str],
+    first_seed: int,
+    output_eos_dir: Optional[str] = None,
+    n_threads: Optional[int] = None,
+    local: bool = False,
+) -> str:
+    """Emit the bash the job (or the local run) executes."""
+    cfg_base = os.path.basename(cfg_file)
+    proc_expr = '"$1"' if not local else "0"
+    threads_arg = f" -n {n_threads}" if n_threads else ""
+
+    lines = [
+        "#!/bin/bash",
+        "# Generated by heptapod CMSSWJobSubmitTool -- see skills/condor/SKILL.md",
+        "set -euo pipefail",
+        "",
+        f"PROC={proc_expr}",
+        f"SEED=$(( {first_seed} + PROC ))",
+        'echo "[heptapod] proc=$PROC seed=$SEED host=$(hostname)"',
+        "",
+        "source /cvmfs/cms.cern.ch/cmsset_default.sh",
+        f"export SCRAM_ARCH={scram_arch}",
+    ]
+
+    if local:
+        lines += [
+            "# Local mode: reuse the release area in the current directory if",
+            "# one is already set up, so repeated runs do not rebuild it.",
+            f"if [ ! -d {cmssw_release} ]; then cmsrel {cmssw_release}; fi",
+        ]
+    else:
+        lines += [
+            "# Condor scratch starts empty; the release area is built per job.",
+            f"cmsrel {cmssw_release}",
+        ]
+
+    lines += [
+        f"cd {cmssw_release}/src",
+        "eval `scramv1 runtime -sh`",
+        "cd -",
+        "",
+        "# Append per-job seeding to the cfg (see _build_seed_patch).",
+        f"cp {cfg_base} job_cfg.py",
+        "export HEPTAPOD_SEED=$SEED",
+        "cat >> job_cfg.py <<'HEPTAPOD_SEED_PATCH'",
+        "import os",
+        _build_seed_patch().strip(),
+        "HEPTAPOD_SEED_PATCH",
+        "",
+        f"cmsRun{threads_arg} job_cfg.py",
+        "",
+    ]
+
+    for out in output_files:
+        stem, ext = os.path.splitext(out)
+        lines.append(f'mv "{out}" "{stem}_${{PROC}}{ext}"')
+
+    if output_eos_dir:
+        eos_dir = output_eos_dir.rstrip("/")
+        lines.append("")
+        lines.append("# Stage out over xrootd; POSIX /eos/uscms is not mounted here.")
+        for out in output_files:
+            stem, ext = os.path.splitext(out)
+            lines.append(
+                f'xrdcp -f "{stem}_${{PROC}}{ext}" '
+                f'"{eos_dir}/{stem}_${{PROC}}{ext}"'
+            )
+
+    lines.append("")
+    return "\n".join(lines)
+
+
+def _build_jdl(
+    executable: str,
+    transfer_input_files: List[str],
+    output_files: List[str],
+    image: str,
+    n_jobs: int,
+    request_cpus: int,
+    request_memory_mb: int,
+    request_disk_kb: int,
+    proxy_path: Optional[str],
+    stage_out_to_eos: bool,
+    max_retries: int = 3,
+) -> str:
+    """
+    Emit the submit description.
+
+    `transfer_output_files` is always written explicitly. Left unset, HTCondor
+    returns every new file in the job's scratch directory -- which, because the
+    wrapper runs `cmsrel` there, means copying a multi-GB release area back to
+    the submit directory.
+    """
+    per_job_outputs = (
+        "" if stage_out_to_eos
+        else ", ".join(
+            f"{os.path.splitext(o)[0]}_$(Process){os.path.splitext(o)[1]}"
+            for o in output_files
+        )
+    )
+
+    lines = [
+        "# Generated by heptapod CMSSWJobSubmitTool -- see skills/condor/SKILL.md",
+        "universe                = vanilla",
+        f"executable              = {executable}",
+        "arguments               = $(Process)",
+        "",
+        "should_transfer_files   = YES",
+        "when_to_transfer_output = ON_EXIT",
+    ]
+    if transfer_input_files:
+        lines.append(
+            "transfer_input_files    = " + ", ".join(transfer_input_files)
+        )
+    # Explicit even when empty: the default would return the whole scratch dir.
+    lines.append(f'transfer_output_files   = {per_job_outputs}')
+    lines += [
+        "",
+        "output                  = logs/job.$(Cluster).$(Process).out",
+        "error                   = logs/job.$(Cluster).$(Process).err",
+        "log                     = logs/job.$(Cluster).log",
+        "",
+        f"request_cpus            = {request_cpus}",
+        f"request_memory          = {request_memory_mb}",
+        f"request_disk            = {request_disk_kb}",
+        "",
+        f'+ApptainerImage         = "{image}"',
+    ]
+    if proxy_path:
+        lines.append(f"x509userproxy           = {proxy_path}")
+    lines += [
+        "",
+        f"max_retries             = {max_retries}",
+        f"queue {n_jobs}",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+# ====================================================================== #
+# =============================== Tools ================================ #
+# ====================================================================== #
+
+class CMSSWJobSubmitTool(BaseTool):
+    """
+    Prepare a `cmsRun` job for HTCondor -- the default execution mode for
+    CMSSW work in this toolkit -- writing a submit description and a job
+    wrapper, and optionally submitting them.
+
+    Set use_condor=False to get an equivalent local run script instead. That
+    is the documented escape hatch for a quick few-event check; anything past
+    a few hundred events belongs in batch, where the per-job wall time and the
+    node's memory are not shared with an interactive session.
+
+    What the generated files encode, all of which are silent failures when
+    done by hand (skills/condor/SKILL.md):
+
+      * per-job random seeds, so `queue N` produces N *different* samples;
+      * an explicit transfer_output_files, so the release area built inside
+        the job is not copied back;
+      * the apptainer image matching SCRAM_ARCH, so an EL8 release does not
+        land on an EL9 worker;
+      * a reachability check on absolute paths in the cfg, since the worker
+        sees neither /uscms_data nor $HOME nor POSIX EOS.
+
+    Nothing is submitted unless submit=True. The default writes the files and
+    returns the exact command to run, so the submission stays an explicit act.
+
+    Input:
+        cfg_file: path to the cmsRun python config (as produced by
+            `cmsDriver.py --no_exec --python_filename ...`).
+        cmssw_release / scram_arch: the release to set up in the job, and the
+            arch that selects the container image.
+        n_jobs: size of the cluster; each job gets seed first_seed + Process.
+        output_files: files cmsRun produces that you want back, suffixed with
+            _<Process> per job.
+
+    Output: JSON with the written paths, the resolved image, the submit
+    command, and any warnings.
+    """
+
+    # ======================== Runtime fields ======================== #
+    cfg_file: Optional[str] = RuntimeField(
+        default=None,
+        description="Path to the cmsRun python cfg to run (e.g. step1_cfg.py)",
+    )
+    cmssw_release: Optional[str] = RuntimeField(
+        default=None,
+        description="CMSSW release to set up inside the job, e.g. CMSSW_12_4_8",
+    )
+    scram_arch: Optional[str] = RuntimeField(
+        default=None,
+        description="SCRAM_ARCH of that release, e.g. el8_amd64_gcc10. Selects "
+        "the apptainer image (el8_* -> cms:rhel8).",
+    )
+    n_jobs: int = RuntimeField(
+        default=1,
+        description="Number of jobs in the cluster. Each gets a distinct seed.",
+    )
+    first_seed: int = RuntimeField(
+        default=_DEFAULT_SEED,
+        description="Seed for Process 0; job N uses first_seed + N.",
+    )
+    output_files: Optional[List[str]] = RuntimeField(
+        default=None,
+        description="Output filenames cmsRun writes, e.g. ['step1.root']. Each "
+        "is renamed to <stem>_<Process><ext> before transfer.",
+    )
+    transfer_input_files: Optional[List[str]] = RuntimeField(
+        default=None,
+        description="Extra files the job needs (gridpack tarball, fragment, "
+        "...). The cfg itself is added automatically.",
+    )
+    output_eos_dir: Optional[str] = RuntimeField(
+        default=None,
+        description="Optional xrootd destination, e.g. "
+        "root://cmseos.fnal.gov//store/user/<you>/<dir>. If set, outputs are "
+        "staged out with xrdcp instead of transferred back.",
+    )
+    request_cpus: int = RuntimeField(
+        default=1, description="Cores per job; must cover cmsRun's -n threads.")
+    request_memory_mb: int = RuntimeField(
+        default=4000, description="Memory per job in MB (GEN-SIM ~4000, "
+        "DIGI/RECO with premix wants ~8000).")
+    request_disk_kb: int = RuntimeField(
+        default=10_000_000, description="Scratch per job in KB.")
+    n_threads: Optional[int] = RuntimeField(
+        default=None,
+        description="Pass -n to cmsRun. Must be <= request_cpus.",
+    )
+    proxy_path: Optional[str] = RuntimeField(
+        default=None,
+        description="Grid proxy to ship with the job. Defaults to "
+        "$X509_USER_PROXY when set. Needed for xrootd reads (premix pileup) "
+        "and EOS stage-out.",
+    )
+    job_dir: Optional[str] = RuntimeField(
+        default=None,
+        description="Directory to write the submit files into, relative to "
+        "base_directory unless absolute. Must be on shared storage, not /tmp.",
+    )
+    use_condor: bool = RuntimeField(
+        default=True,
+        description="Run on HTCondor (default). False emits an equivalent "
+        "local run script instead -- use only for short interactive checks.",
+    )
+    allow_nonshared_submit_dir: bool = RuntimeField(
+        default=False,
+        description="Override the shared-filesystem check on job_dir. That "
+        "check is a path heuristic (rejects /tmp, /var/tmp, ...) and is right "
+        "wherever the schedd is a separate host; set True at a site where the "
+        "schedd shares your node's local disk.",
+    )
+    submit: bool = RuntimeField(
+        default=False,
+        description="Actually run condor_submit. Default False writes the "
+        "files and returns the command.",
+    )
+    # ================================================================ #
+
+    # ========================= State fields ========================= #
+    base_directory: str = StateField(
+        description="Base sandbox directory for file operations"
+    )
+    # ================================================================ #
+
+    def _setup(self):
+        self.base_directory = os.path.abspath(self.base_directory)
+
+    def _run(self) -> str:
+        missing = [
+            n for n in ("cfg_file", "cmssw_release", "scram_arch")
+            if not getattr(self, n)
+        ]
+        if missing:
+            return self.format_error(
+                error="Missing required input",
+                reason=f"{', '.join(missing)} must be provided.",
+                suggestion="cmsDriver.py --no_exec --python_filename <cfg> "
+                           "writes the cfg; scram_arch is the one the release "
+                           "was built for.",
+            )
+
+        cfg_path = self.cfg_file
+        if not os.path.isabs(cfg_path):
+            cfg_path = os.path.join(self.base_directory, cfg_path)
+        if not os.path.isfile(cfg_path):
+            return self.format_error(
+                error="cfg not found",
+                reason=f"{cfg_path!r} does not exist.",
+                suggestion="Pass a path to an existing cmsRun cfg.",
+            )
+
+        image, os_tag = _image_for_arch(self.scram_arch)
+        if image is None:
+            return self.format_error(
+                error="Unrecognized SCRAM_ARCH",
+                reason=f"No container image known for {self.scram_arch!r}.",
+                context=f"Known prefixes: {', '.join(sorted(_ARCH_IMAGE_MAP))}.",
+                suggestion="A wrong image fails with missing-library errors "
+                           "that never name the image, so this is not guessed.",
+            )
+
+        if self.n_threads and self.n_threads > self.request_cpus:
+            return self.format_error(
+                error="Thread/slot mismatch",
+                reason=f"n_threads={self.n_threads} exceeds "
+                       f"request_cpus={self.request_cpus}.",
+                suggestion="Raise request_cpus to match, or the job "
+                           "oversubscribes its slot and runs slower than "
+                           "single-threaded.",
+            )
+
+        job_dir = self.job_dir or "condor_jobs"
+        if not os.path.isabs(job_dir):
+            job_dir = os.path.join(self.base_directory, job_dir)
+        job_dir = os.path.abspath(job_dir)
+
+        warnings: List[str] = []
+        if self.use_condor and not self.allow_nonshared_submit_dir:
+            dir_error = _check_submit_dir(job_dir)
+            if dir_error:
+                return self.format_error(
+                    error="Submit directory not on shared storage",
+                    reason=dir_error,
+                    suggestion="If your site's schedd really does share this "
+                               "node's local disk, set "
+                               "allow_nonshared_submit_dir=True.",
+                )
+
+        os.makedirs(os.path.join(job_dir, "logs"), exist_ok=True)
+
+        output_files = list(self.output_files or ["step1.root"])
+        transfer_in = list(self.transfer_input_files or [])
+
+        cfg_text = ""
+        try:
+            with open(cfg_path) as fh:
+                cfg_text = fh.read()
+        except OSError as e:  # unreadable cfg is a warning, not a hard stop
+            warnings.append(f"Could not read cfg for path checking: {e}")
+        if cfg_text:
+            warnings.extend(_scan_unreachable_inputs(cfg_text, transfer_in))
+
+        if self.n_jobs > 1 and self.first_seed <= 0:
+            warnings.append(
+                "first_seed <= 0: Pythia8 treats seed 0 as 'pick from the "
+                "clock', which makes the run irreproducible."
+            )
+
+        proxy = self.proxy_path or os.environ.get("X509_USER_PROXY")
+        if not proxy:
+            warnings.append(
+                "No grid proxy found (proxy_path unset and X509_USER_PROXY "
+                "not in the environment). Jobs reading premix pileup over "
+                "xrootd, or staging out to EOS, will fail without one; run "
+                "voms-proxy-init first."
+            )
+
+        wrapper_name = "run_cmssw.sh" if self.use_condor else "run_cmssw_local.sh"
+        wrapper_path = os.path.join(job_dir, wrapper_name)
+        wrapper_text = _build_wrapper(
+            cfg_file=cfg_path,
+            cmssw_release=self.cmssw_release,
+            scram_arch=self.scram_arch,
+            output_files=output_files,
+            first_seed=self.first_seed,
+            output_eos_dir=self.output_eos_dir,
+            n_threads=self.n_threads,
+            local=not self.use_condor,
+        )
+        with open(wrapper_path, "w") as fh:
+            fh.write(wrapper_text)
+        os.chmod(wrapper_path, 0o755)
+
+        written = {"wrapper": wrapper_path}
+        result: Dict[str, Any] = {
+            "status": "ok",
+            "schema": SCHEMA_VERSION,
+            "mode": "condor" if self.use_condor else "local",
+            "container_image": image,
+            "container_os": os_tag,
+            "seeds": [self.first_seed + i for i in range(self.n_jobs)][:10],
+            "n_jobs": self.n_jobs if self.use_condor else 1,
+        }
+
+        if not self.use_condor:
+            result["written"] = written
+            result["run_command"] = f"cd {job_dir} && ./{wrapper_name}"
+            result["note"] = (
+                "Local mode: no seeding parallelism, one sample only. This is "
+                "the escape hatch, not the default -- prefer use_condor=True "
+                "for anything past a short check."
+            )
+            if warnings:
+                result["warnings"] = warnings
+            return json.dumps(result, indent=2)
+
+        all_inputs = [cfg_path] + transfer_in
+        jdl_path = os.path.join(job_dir, "submit.jdl")
+        jdl_text = _build_jdl(
+            executable=wrapper_name,
+            transfer_input_files=all_inputs,
+            output_files=output_files,
+            image=image,
+            n_jobs=self.n_jobs,
+            request_cpus=self.request_cpus,
+            request_memory_mb=self.request_memory_mb,
+            request_disk_kb=self.request_disk_kb,
+            proxy_path=proxy,
+            stage_out_to_eos=bool(self.output_eos_dir),
+        )
+        with open(jdl_path, "w") as fh:
+            fh.write(jdl_text)
+        written["jdl"] = jdl_path
+
+        submit_command = f"cd {job_dir} && condor_submit submit.jdl"
+        result["written"] = written
+        result["submit_command"] = submit_command
+
+        if self.submit:
+            try:
+                completed = subprocess.run(
+                    ["condor_submit", "submit.jdl"],
+                    cwd=job_dir, capture_output=True, text=True, timeout=180,
+                )
+            except FileNotFoundError:
+                result["submitted"] = False
+                warnings.append(
+                    "condor_submit not found on PATH -- files were written but "
+                    "not submitted."
+                )
+            except subprocess.TimeoutExpired:
+                result["submitted"] = False
+                warnings.append("condor_submit timed out after 180 s.")
+            else:
+                result["submitted"] = completed.returncode == 0
+                result["submit_stdout"] = completed.stdout.strip()
+                if completed.returncode != 0:
+                    result["submit_stderr"] = completed.stderr.strip()
+                else:
+                    cluster = _parse_cluster_id(completed.stdout)
+                    if cluster:
+                        result["cluster_id"] = cluster
+        else:
+            result["submitted"] = False
+
+        if warnings:
+            result["warnings"] = warnings
+        return json.dumps(result, indent=2)
+
+
+_CLUSTER_RE = re.compile(r"submitted to cluster (\d+)")
+
+
+def _parse_cluster_id(stdout: str) -> Optional[str]:
+    """Pull the cluster id out of condor_submit's confirmation line."""
+    match = _CLUSTER_RE.search(stdout or "")
+    return match.group(1) if match else None
+
+
+class CondorJobStatusTool(BaseTool):
+    """
+    Report the state of an HTCondor cluster: per-status counts, hold reasons,
+    and the tail of a failing job's log.
+
+    Read-only. Note that at sites which load-balance across schedd hosts, a
+    plain `condor_q <cluster>` may not find a job submitted through a
+    different schedd -- pass schedd_name (condor_submit reports which one it
+    used) when a known-live cluster comes back empty.
+
+    Input:
+        cluster_id: the cluster to query.
+        schedd_name: schedd host, if the cluster is not on the default one.
+        job_dir: directory holding logs/, for tailing a held job's stderr.
+    """
+
+    # ======================== Runtime fields ======================== #
+    cluster_id: Optional[str] = RuntimeField(
+        default=None, description="Cluster id returned by condor_submit")
+    schedd_name: Optional[str] = RuntimeField(
+        default=None,
+        description="Schedd host, e.g. lpcschedd6.fnal.gov. Needed at sites "
+        "that spread submissions across several schedds.",
+    )
+    job_dir: Optional[str] = RuntimeField(
+        default=None,
+        description="Job directory containing logs/, for error-log tails.")
+    # ================================================================ #
+
+    # ========================= State fields ========================= #
+    base_directory: str = StateField(
+        description="Base sandbox directory for file operations"
+    )
+    # ================================================================ #
+
+    _STATUS_NAMES = {
+        "1": "idle", "2": "running", "3": "removed",
+        "4": "completed", "5": "held", "6": "transferring_output",
+        "7": "suspended",
+    }
+
+    def _setup(self):
+        self.base_directory = os.path.abspath(self.base_directory)
+
+    def _run(self) -> str:
+        if not self.cluster_id:
+            return self.format_error(
+                error="Missing required input",
+                reason="cluster_id must be provided.",
+            )
+
+        cmd = ["condor_q"]
+        if self.schedd_name:
+            cmd += ["-name", self.schedd_name]
+        cmd += [str(self.cluster_id), "-af", "ProcId", "JobStatus", "HoldReason"]
+
+        try:
+            completed = subprocess.run(
+                cmd, capture_output=True, text=True, timeout=120)
+        except FileNotFoundError:
+            return self.format_error(
+                error="condor_q not found",
+                reason="HTCondor client tools are not on PATH.",
+                suggestion="Run this from a submit node.",
+            )
+        except subprocess.TimeoutExpired:
+            return self.format_error(
+                error="condor_q timed out", reason="No response within 120 s.")
+
+        if completed.returncode != 0:
+            return self.format_error(
+                error="condor_q failed",
+                reason=completed.stderr.strip(),
+                context=" ".join(shlex.quote(c) for c in cmd),
+            )
+
+        counts: Dict[str, int] = {}
+        holds: List[Dict[str, str]] = []
+        for line in completed.stdout.splitlines():
+            if not line.strip():
+                continue
+            parts = line.split(None, 2)
+            if len(parts) < 2:
+                continue
+            proc, status = parts[0], parts[1]
+            reason = parts[2].strip() if len(parts) > 2 else ""
+            name = self._STATUS_NAMES.get(status, f"unknown({status})")
+            counts[name] = counts.get(name, 0) + 1
+            if name == "held" and reason and reason != "undefined":
+                holds.append({"proc": proc, "reason": reason})
+
+        result: Dict[str, Any] = {
+            "status": "ok",
+            "schema": SCHEMA_VERSION,
+            "cluster_id": str(self.cluster_id),
+            "counts": counts,
+        }
+        if not counts:
+            result["note"] = (
+                "No jobs in the queue for this cluster: it either finished "
+                "(check condor_history) or lives on another schedd (pass "
+                "schedd_name)."
+            )
+        if holds:
+            result["held_jobs"] = holds[:20]
+
+        job_dir = self.job_dir
+        if job_dir:
+            if not os.path.isabs(job_dir):
+                job_dir = os.path.join(self.base_directory, job_dir)
+            err_dir = os.path.join(job_dir, "logs")
+            if os.path.isdir(err_dir):
+                tails = {}
+                for fname in sorted(os.listdir(err_dir)):
+                    if not fname.endswith(".err"):
+                        continue
+                    fpath = os.path.join(err_dir, fname)
+                    try:
+                        if os.path.getsize(fpath) == 0:
+                            continue
+                        with open(fpath) as fh:
+                            tails[fname] = "".join(fh.readlines()[-20:])
+                    except OSError:
+                        continue
+                    if len(tails) >= 5:
+                        break
+                if tails:
+                    result["error_log_tails"] = tails
+
+        return json.dumps(result, indent=2)

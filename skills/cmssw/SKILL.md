@@ -203,11 +203,12 @@ usually no matching published routine. Pick one:
    and Run 3 values, and the wrong tune module imports without complaint
    (pitfall P8). Leave `lhaid` as the `$DEFAULT_PDF_SETS` placeholder unless
    you mean to pin a PDF (P9).
-8. **Interactive or batch?** Anything past a few hundred events wants
-   HTCondor — GEN-SIM dominates and splits cleanly by seed. Note the job sees
+8. **Interactive or batch?** Batch, by default — see the `condor` skill and
+   its `CMSSWJobSubmitTool`. Anything past a few hundred events wants
+   HTCondor: GEN-SIM dominates and splits cleanly by seed. Note the job sees
    *none* of your work area, so the gridpack and cfg have to be transferred or
    staged on cvmfs, and per-job random seeds have to be set explicitly or every
-   job regenerates identical events. See `references/condor.md`.
+   job regenerates identical events.
 
 ## Running
 
@@ -279,10 +280,9 @@ rivet-mkhtml --mc-errs *.yoda   # only if a matching routine exists
   PDG codes, SCRAM_ARCH/genproductions-MG5-version mismatches, the
   empty-`processParameters` segfault, campaign-specific fragment boilerplate,
   and the `$DEFAULT_PDF_SETS` placeholder.
-- **`references/condor.md`** — running `cmsRun` on HTCondor: what the worker
-  node actually has (no `/uscms_data`, no `$HOME`, `/cvmfs` and a proxy yes),
-  the EL8 image ClassAd, per-job seeding, output via transfer or `xrdcp` to
-  EOS, and a probe job for re-verifying all of it at another site.
+- **the `condor` skill** — the batch path for everything under "Running"
+  below. Its `CMSSWJobSubmitTool` generates the submit files, and its
+  `references/lpc_environment.md` records what a worker node actually provides.
 - **`references/card_corpus.md`** — how to search `cms-gen/genproductions_cards`
   for an existing card set, an already-published UFO, or the real distribution
   of a campaign convention; plus why counting patterns in the tree beats

@@ -22,6 +22,10 @@ this file is environment/repo notes for working on the codebase itself.
   each step's real `cmsDriver` command from its McM chained request. This is
   the one for "make me events that look like dataset X."
 
+Both produce `cmsRun` configs, and **batch is the default way to run them**:
+`skills/condor` and its `CMSSWJobSubmitTool` (`use_condor` defaults to True).
+Interactive `cmsRun` is for short checks only.
+
 ## CMS-internal material: ask before reading, never quote into this repo
 
 This repo is a **public** fork. Some CMS sources are access-controlled, and
