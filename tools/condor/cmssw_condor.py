@@ -148,6 +148,16 @@ def _build_seed_patch() -> str:
     correct across cfgs with different module sets. Without this, `queue N`
     yields N identical copies of the same events with no error anywhere.
 
+    Distinct physics is not enough: the outputs also need distinct **event
+    IDs**. An `EmptySource` cfg numbers events (run 1, lumi 1, event 1..N)
+    regardless of RNG seeds, so N jobs produce N files whose events collide.
+    Nothing complains until the files are chained into a later step, where
+    PoolSource's duplicate check drops everything but the first file --
+    reporting it as an information-level "some events were skipped because of
+    duplicate checking" and a correct-looking job. `firstLuminosityBlock` is
+    therefore set per job, and unconditionally, since cmsDriver does not write
+    the parameter for a hasattr guard to find.
+
     **Gridpack path.** `ExternalLHEProducer` args must be ABSOLUTE at job run
     time. Its helper `run_generic_tarball_cvmfs.sh` does
 
@@ -172,8 +182,13 @@ if hasattr(process, "RandomNumberGeneratorService"):
         _mod = getattr(_rng, _name)
         if hasattr(_mod, "initialSeed"):
             _mod.initialSeed = cms.untracked.uint32(_seed)
-if hasattr(process, "source") and hasattr(process.source, "firstLuminosityBlock"):
+if hasattr(process, "source") and process.source.type_() == "EmptySource":
+    # Set unconditionally, NOT under hasattr: cmsDriver does not write this
+    # parameter, so a hasattr guard skips it and every job emits event IDs
+    # (run 1, lumi 1, event 1..N). PoolSource then drops all but the first
+    # file's events as duplicates when the outputs are chained downstream.
     process.source.firstLuminosityBlock = cms.untracked.uint32(_seed)
+    print("[heptapod] source.firstLuminosityBlock =", _seed)
 if hasattr(process, "externalLHEProducer"):
     _args = []
     for _a in process.externalLHEProducer.args:

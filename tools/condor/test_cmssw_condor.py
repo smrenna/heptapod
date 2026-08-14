@@ -267,6 +267,47 @@ def test_job_patch_rewrites_gridpack_path():
     print("[OK] test_job_patch_rewrites_gridpack_path")
 
 
+def test_job_patch_sets_first_lumi_unconditionally():
+    """EmptySource cfgs must get distinct event IDs, not just distinct seeds."""
+    import os as _os, types
+    text = _build_wrapper(
+        cfg_files=["gen_cfg.py"], cmssw_release="CMSSW_12_4_11_patch3",
+        scram_arch="el8_amd64_gcc10", output_files=["gs.root"], first_seed=1000,
+    )
+    start = text.index("<<'HEPTAPOD_SEED_PATCH'") + len("<<'HEPTAPOD_SEED_PATCH'")
+    patch = text[start:text.index("HEPTAPOD_SEED_PATCH", start)]
+
+    class _VStr(list):
+        def __init__(self, *a): super().__init__(a)
+    _cfgmod = types.ModuleType("FWCore.ParameterSet.Config")
+    _cfgmod.vstring = _VStr
+    _cfgmod.untracked = types.SimpleNamespace(uint32=int)
+    sys.modules.update({
+        "FWCore": types.ModuleType("FWCore"),
+        "FWCore.ParameterSet": types.ModuleType("FWCore.ParameterSet"),
+        "FWCore.ParameterSet.Config": _cfgmod})
+
+    class _Src:
+        def __init__(self, kind): self._kind = kind
+        def type_(self): return self._kind
+
+    class _Obj: pass
+
+    # EmptySource: the parameter does NOT pre-exist (cmsDriver omits it), so a
+    # hasattr guard would skip it. It must be set anyway.
+    proc = _Obj(); proc.source = _Src("EmptySource")
+    assert not hasattr(proc.source, "firstLuminosityBlock")
+    _os.environ["HEPTAPOD_SEED"] = "1007"
+    exec(compile(patch, "patch", "exec"), {"os": _os, "process": proc})
+    assert proc.source.firstLuminosityBlock == 1007
+
+    # PoolSource: firstLuminosityBlock is meaningless, must be left alone.
+    proc2 = _Obj(); proc2.source = _Src("PoolSource")
+    exec(compile(patch, "patch", "exec"), {"os": _os, "process": proc2})
+    assert not hasattr(proc2.source, "firstLuminosityBlock")
+    print("[OK] test_job_patch_sets_first_lumi_unconditionally")
+
+
 def test_jdl_always_sets_transfer_output_files():
     """Unset, HTCondor would return the whole scratch dir including the release."""
     jdl = _build_jdl(
@@ -715,6 +756,7 @@ def main():
         test_wrapper_local_mode_reuses_release,
         test_wrapper_runs_multiple_cfgs_in_order,
         test_job_patch_rewrites_gridpack_path,
+        test_job_patch_sets_first_lumi_unconditionally,
         test_jdl_always_sets_transfer_output_files,
         test_parse_cluster_id,
         test_run_condor_cmd_retries_on_enoexec,
