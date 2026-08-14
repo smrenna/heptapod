@@ -454,8 +454,10 @@ def test_tool_accepts_cfg_files_list(tmp_path: Path):
     jdl = Path(result["written"]["jdl"]).read_text()
     assert "digi_cfg.py" in jdl and "reco_cfg.py" in jdl
     # The intermediate is produced and consumed inside the job, so it must not
-    # be transferred back -- only the declared output is.
-    assert "transfer_output_files   = aod_$(Process).root" in jdl
+    # be transferred back -- only the declared output is. This is a single-job
+    # cluster, so the name is cmsRun's own (see
+    # test_single_job_keeps_cmsrun_filenames).
+    assert "transfer_output_files   = aod.root" in jdl
 
     wrapper = Path(result["written"]["wrapper"]).read_text()
     assert wrapper.index("cmsRun job_cfg_0.py") < wrapper.index("cmsRun job_cfg_1.py")
@@ -509,6 +511,35 @@ def test_tool_scans_every_cfg_for_unreachable_paths(tmp_path: Path):
     assert "second_cfg.py:" in joined
     assert "model_tarball.tar.xz" in joined
     print("[OK] test_tool_scans_every_cfg_for_unreachable_paths")
+
+
+def test_single_job_keeps_cmsrun_filenames(tmp_path: Path):
+    """n_jobs=1 must not suffix outputs, or the next stage cannot find them."""
+    cfg = _write_cfg(tmp_path)
+    tool = CMSSWJobSubmitTool(base_directory=str(tmp_path))
+
+    one = json.loads(tool.execute(
+        cfg_file=str(cfg), cmssw_release="CMSSW_13_0_13",
+        scram_arch="el8_amd64_gcc11", n_jobs=1,
+        output_files=["aod.root"], job_dir="one",
+        allow_nonshared_submit_dir=True))
+    wrapper = Path(one["written"]["wrapper"]).read_text()
+    jdl = Path(one["written"]["jdl"]).read_text()
+    # cmsRun's own name survives, so a downstream cfg's --filein still resolves.
+    assert "aod_${PROC}.root" not in wrapper
+    assert "transfer_output_files   = aod.root" in jdl
+
+    # More than one job still needs the suffix to keep outputs apart.
+    many = json.loads(tool.execute(
+        cfg_file=str(cfg), cmssw_release="CMSSW_13_0_13",
+        scram_arch="el8_amd64_gcc11", n_jobs=4,
+        output_files=["aod.root"], job_dir="many",
+        allow_nonshared_submit_dir=True))
+    wrapper = Path(many["written"]["wrapper"]).read_text()
+    jdl = Path(many["written"]["jdl"]).read_text()
+    assert 'mv "aod.root" "aod_${PROC}.root"' in wrapper
+    assert "transfer_output_files   = aod_$(Process).root" in jdl
+    print("[OK] test_single_job_keeps_cmsrun_filenames")
 
 
 def test_tool_local_mode_writes_no_jdl(tmp_path: Path):
@@ -767,6 +798,7 @@ def main():
         test_tool_cfg_file_is_single_element_alias,
         test_tool_rejects_duplicate_cfg_basenames,
         test_tool_scans_every_cfg_for_unreachable_paths,
+        test_single_job_keeps_cmsrun_filenames,
         test_tool_local_mode_writes_no_jdl,
         test_tool_warns_about_unreachable_gridpack,
         test_tool_rejects_bad_inputs,

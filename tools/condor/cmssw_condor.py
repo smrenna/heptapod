@@ -208,6 +208,7 @@ def _build_wrapper(
     output_eos_dir: Optional[str] = None,
     n_threads: Optional[int] = None,
     local: bool = False,
+    suffix_outputs: bool = True,
 ) -> str:
     """
     Emit the bash the job (or the local run) executes.
@@ -273,9 +274,13 @@ def _build_wrapper(
 
     lines.append("")
 
-    for out in output_files:
-        stem, ext = os.path.splitext(out)
-        lines.append(f'mv "{out}" "{stem}_${{PROC}}{ext}"')
+    # A single-job cluster keeps cmsRun's own filenames: the _<Process> suffix
+    # exists only to keep N jobs' outputs apart, and renaming here would break
+    # the next stage, whose cfg names the file cmsDriver was told to write.
+    if suffix_outputs:
+        for out in output_files:
+            stem, ext = os.path.splitext(out)
+            lines.append(f'mv "{out}" "{stem}_${{PROC}}{ext}"')
 
     if output_eos_dir:
         eos_dir = output_eos_dir.rstrip("/")
@@ -283,10 +288,8 @@ def _build_wrapper(
         lines.append("# Stage out over xrootd; POSIX /eos/uscms is not mounted here.")
         for out in output_files:
             stem, ext = os.path.splitext(out)
-            lines.append(
-                f'xrdcp -f "{stem}_${{PROC}}{ext}" '
-                f'"{eos_dir}/{stem}_${{PROC}}{ext}"'
-            )
+            name = f"{stem}_${{PROC}}{ext}" if suffix_outputs else out
+            lines.append(f'xrdcp -f "{name}" "{eos_dir}/{name}"')
 
     lines.append("")
     return "\n".join(lines)
@@ -304,6 +307,7 @@ def _build_jdl(
     proxy_path: Optional[str],
     stage_out_to_eos: bool,
     max_retries: int = 3,
+    suffix_outputs: bool = True,
 ) -> str:
     """
     Emit the submit description.
@@ -316,7 +320,8 @@ def _build_jdl(
     per_job_outputs = (
         "" if stage_out_to_eos
         else ", ".join(
-            f"{os.path.splitext(o)[0]}_$(Process){os.path.splitext(o)[1]}"
+            (f"{os.path.splitext(o)[0]}_$(Process){os.path.splitext(o)[1]}"
+             if suffix_outputs else o)
             for o in output_files
         )
     )
@@ -621,6 +626,7 @@ class CMSSWJobSubmitTool(BaseTool):
             output_eos_dir=self.output_eos_dir,
             n_threads=self.n_threads,
             local=not self.use_condor,
+            suffix_outputs=self.n_jobs > 1,
         )
         with open(wrapper_path, "w") as fh:
             fh.write(wrapper_text)
@@ -662,6 +668,7 @@ class CMSSWJobSubmitTool(BaseTool):
             request_disk_kb=self.request_disk_kb,
             proxy_path=proxy,
             stage_out_to_eos=bool(self.output_eos_dir),
+            suffix_outputs=self.n_jobs > 1,
         )
         with open(jdl_path, "w") as fh:
             fh.write(jdl_text)
