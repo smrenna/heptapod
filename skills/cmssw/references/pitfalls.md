@@ -308,6 +308,11 @@ and still leaves a small non-empty output file, so `[ -s output.root ]` and
 these steps in a script, gate on a completed `TimeReport> Time report complete`
 plus a plausible file size, and grep for `segmentation violation` too.
 
+Note **which stream** you grep: cmsRun writes `TimeReport` to **stderr**. Under
+HTCondor that means the job's `.err` file, not `.out`, and a guard pointed at
+`.out` finds nothing and condemns every healthy job. The reliable check on a
+GEN step is simply the output's event count.
+
 ## P8 — The fragment's boilerplate is campaign-specific, and the wrong tune module imports cleanly
 
 Three lines of a GEN fragment look like inert boilerplate and are not: the
