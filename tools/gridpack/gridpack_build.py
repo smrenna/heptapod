@@ -419,10 +419,26 @@ class GridpackBuildTool(BaseTool):
         if err == "outside":
             dest = os.path.join(mg5_dir, "cards", self.process_name)
             os.makedirs(dest, exist_ok=True)
-            for fname in sorted(os.listdir(cards_src)):
-                src_file = os.path.join(cards_src, fname)
-                if os.path.isfile(src_file):
-                    shutil.copy2(src_file, os.path.join(dest, fname))
+            wanted = {f for f in os.listdir(cards_src)
+                      if os.path.isfile(os.path.join(cards_src, f))}
+            # SYNC, not copy. A card deleted from the source must disappear
+            # here too: an orphaned _extramodels.dat left from a previous
+            # attempt is still honoured by gridpack_generation.sh, so the
+            # build silently uses a card the author believes they removed.
+            stale = [f for f in os.listdir(dest)
+                     if os.path.isfile(os.path.join(dest, f)) and f not in wanted]
+            for fname in stale:
+                os.remove(os.path.join(dest, fname))
+            if stale:
+                warnings.append(
+                    f"Removed stale card(s) from the genproductions tree that "
+                    f"are no longer in the source directory: "
+                    f"{', '.join(sorted(stale))}. They would otherwise still "
+                    "have been used by the build."
+                )
+            for fname in sorted(wanted):
+                shutil.copy2(os.path.join(cards_src, fname),
+                             os.path.join(dest, fname))
             rel = os.path.relpath(dest, mg5_dir)
             warnings.append(
                 f"Cards copied into the genproductions tree at {dest} and "

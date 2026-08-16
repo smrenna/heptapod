@@ -349,6 +349,28 @@ def test_launch_dir_covers_the_script_itself(tmp_path: Path):
     print("[OK] test_launch_dir_covers_the_script_itself")
 
 
+def test_cards_are_synced_not_merely_copied(tmp_path: Path):
+    """A card deleted from the source must not survive in the build tree."""
+    mg5 = _fake_genproductions(tmp_path)
+    cards = _cards(tmp_path)
+    dest = mg5 / "cards" / "MyProc"
+    dest.mkdir(parents=True)
+    # Left over from an earlier attempt; gridpack_generation.sh still honours it.
+    (dest / "MyProc_extramodels.dat").write_text("SomeModel.tar.gz\n")
+
+    tool = GridpackBuildTool(base_directory=str(tmp_path))
+    r = json.loads(tool.execute(
+        process_name="MyProc", cards_dir=str(cards),
+        genproductions_dir=str(tmp_path / "genproductions"),
+        scram_arch="el8_amd64_gcc10"))
+
+    assert not (dest / "MyProc_extramodels.dat").exists(), \
+        "stale card survived; the build would still have used it"
+    assert (dest / "MyProc_proc_card.dat").is_file()
+    assert any("stale card" in w for w in r["warnings"])
+    print("[OK] test_cards_are_synced_not_merely_copied")
+
+
 def test_tool_rejects_bad_inputs(tmp_path: Path):
     """Unknown arch, absent genproductions, and missing fields are hard errors."""
     _fake_genproductions(tmp_path)
@@ -415,6 +437,7 @@ def main():
         test_relative_carddir,
         test_customizecards_forbidden_literal,
         test_tool_rejects_forbidden_literal,
+        test_cards_are_synced_not_merely_copied,
         test_tool_copies_outside_cards_and_goes_relative,
         test_tool_launch_dir_covers_local_model,
         test_tool_warns_on_missing_model,
