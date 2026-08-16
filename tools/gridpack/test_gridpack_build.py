@@ -223,6 +223,10 @@ def test_build_script_uses_relative_carddir():
     assert "./gridpack_generation.sh MyProc cards/MyProc local ALL el8_amd64_gcc10" in text
     assert "unset PYTHONPATH" in text
     assert "export SCRAM_ARCH=el8_amd64_gcc10" in text
+    # An LCG view on PATH puts an EL9 gfortran inside the EL8 container, where
+    # it cannot run; MG5 reports only "A compilation Error occurs".
+    assert "/cvmfs/sft.cern.ch/lcg/" in text
+    assert "VIRTUAL_ENV" in text
     # No absolute carddir anywhere in the invocation.
     assert " /a/b/genproductions/bin/MadGraph5_aMCatNLO/cards" not in text
     print("[OK] test_build_script_uses_relative_carddir")
