@@ -313,7 +313,7 @@ def main():
     )
     parser.add_argument(
         "--only",
-        choices=["prereqs", "conversions", "kinematics", "reconstruction", "delta_r_filter", "feynrules", "mg5", "pythia", "sherpa", "llm", "pdg", "inspire", "units", "nda", "eda", "feyngraph", "logging", "central_production", "condor"],
+        choices=["prereqs", "conversions", "kinematics", "reconstruction", "delta_r_filter", "feynrules", "mg5", "pythia", "sherpa", "llm", "pdg", "inspire", "units", "nda", "eda", "feyngraph", "logging", "central_production", "condor", "gridpack"],
         help="Run only tests for specified component (prereqs = prerequisites check only)"
     )
     parser.add_argument(
@@ -392,8 +392,15 @@ def main():
             "description": "Unit conversion tools (natural units, metric prefix conversions)"
         },
         "central_production": {
-            "script": REPO_ROOT / "tools" / "central_production" / "test_mcm_chain.py",
-            "description": "Central-production McM chain resolution (get_setup parsing, chain walking)"
+            "scripts": [
+                REPO_ROOT / "tools" / "central_production" / "test_mcm_chain.py",
+                REPO_ROOT / "tools" / "central_production" / "test_cmsdriver_chain.py",
+            ],
+            "description": "Central-production McM chain resolution and cmsDriver chain generation"
+        },
+        "gridpack": {
+            "script": REPO_ROOT / "tools" / "gridpack" / "test_gridpack_build.py",
+            "description": "Gridpack builds via genproductions (carddir, bind mounts, arch, log parsing)"
         },
         "condor": {
             "script": REPO_ROOT / "tools" / "condor" / "test_cmssw_condor.py",

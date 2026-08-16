@@ -84,6 +84,12 @@ bundles:
   feynrules:
     requires: [feynrules_path, wolframscript_path]
 
+  # ── MadGraph gridpack builds via CMS genproductions ──────────────
+  # No pip deps: drives genproductions' own gridpack_generation.sh, which
+  # downloads and runs its own pinned MG5 (so mg5_path is NOT required, and
+  # deliberately not used -- the sandboxed MG5 is the one that matters).
+  gridpack: {}
+
   # ── batch execution of CMSSW jobs via HTCondor ───────────────────
   # No pip deps: shells out to the HTCondor client tools (condor_submit,
   # condor_q) on a submit node. The generated jobs need /cvmfs and a grid
@@ -185,6 +191,14 @@ tools:
     description: Build a Pythia-readable decay-table fragment to decay a BSM state the
       LHE left stable (e.g. GMSB neutralino -> photon + gravitino).
     bundle: bsm
+  - module: tools.gridpack.gridpack_build
+    name: GridpackBuildTool
+    description: Build a MadGraph gridpack from a cards directory via CMS
+      genproductions, handling the path constraints that make the script fail
+      obscurely - relative carddir, the container binding only the cwd, and
+      SCRAM_ARCH matching the showering release. Verifies the tarball and
+      cross-section afterwards.
+    bundle: gridpack
   - module: tools.condor.cmssw_condor
     name: CMSSWJobSubmitTool
     description: Prepare (and optionally submit) a cmsRun job as an HTCondor
@@ -199,6 +213,14 @@ tools:
     description: Report an HTCondor cluster's per-status counts, hold reasons,
       and failing jobs' error-log tails.
     bundle: condor
+  - module: tools.central_production.cmsdriver_chain
+    name: CMSDriverChainTool
+    description: Turn a resolved production chain (MCMChainTool output) into
+      runnable cmsDriver commands, re-pointing every step's input at the
+      previous step's output, splitting at CMSSW release boundaries, and
+      carrying the campaign conditions through verbatim. Feeds
+      CMSSWJobSubmitTool, one cluster per release group.
+    bundle: central_production
   - module: tools.central_production.mcm_chain
     name: MCMChainTool
     description: Resolve a central CMS dataset or McM request prepid into the
