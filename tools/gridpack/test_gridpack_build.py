@@ -32,6 +32,7 @@ from tools.gridpack.gridpack_build import (
     _common_launch_dir,
     _container_for_arch,
     _parse_gridpack_log,
+    _verify_build,
     _proc_card_model_path,
     _relative_carddir,
 )
@@ -148,6 +149,32 @@ def test_parse_gridpack_log():
     assert "cross_section_pb" not in only_zero
     assert _parse_gridpack_log("")["n_cross_section_reports"] == 0
     print("[OK] test_parse_gridpack_log")
+
+
+def test_verify_build_rejects_a_successful_looking_failure():
+    """A tarball is not evidence: the script claims success on a failed build."""
+    # Real shape of the failure: compute_widths could not compile, integration
+    # never ran, yet a small tarball was written and "created successfully"
+    # printed.
+    bad = {"tarball": "/x/gp.tar.xz", "tarball_bytes": 5_067_588,
+           "n_cross_section_reports": 0, "cross_sections_pb": []}
+    problems = _verify_build(bad)
+    assert problems and "BUILD LOOKS FAILED" in problems[0]
+
+    # A genuine build reports a cross-section and is not flagged.
+    good = {"tarball": "/x/gp.tar.xz", "tarball_bytes": 33_144_832,
+            "cross_section_pb": 8.991e-06, "n_cross_section_reports": 2}
+    assert _verify_build(good) == []
+
+    # An implausibly small tarball is flagged even with a cross-section.
+    tiny = {"tarball": "/x/gp.tar.xz", "tarball_bytes": 4096,
+            "cross_section_pb": 1.0, "n_cross_section_reports": 1}
+    assert any("far below" in p for p in _verify_build(tiny))
+
+    # No tarball at all.
+    assert _verify_build({"tarball": None,
+                          "tarball_error": "nope"}) == ["nope"]
+    print("[OK] test_verify_build_rejects_a_successful_looking_failure")
 
 
 def test_build_script_uses_relative_carddir():
@@ -335,6 +362,7 @@ def main():
         test_proc_card_model_path,
         test_common_launch_dir,
         test_parse_gridpack_log,
+        test_verify_build_rejects_a_successful_looking_failure,
         test_build_script_uses_relative_carddir,
         test_launch_command_cds_to_common_ancestor,
     ]

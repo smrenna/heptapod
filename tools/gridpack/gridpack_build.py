@@ -136,6 +136,38 @@ def _parse_gridpack_log(text: str) -> Dict[str, Any]:
     return result
 
 
+def _verify_build(result: Dict[str, Any]) -> List[str]:
+    """
+    Decide whether a finished build actually produced anything usable.
+
+    gridpack_generation.sh prints "Gridpack created successfully" and writes a
+    tarball even when the run failed partway -- observed when compute_widths
+    could not compile its temporary decay process, which left a tarball with no
+    process/ directory and no integration at all. So a present tarball is not
+    evidence of success; a reported cross-section is.
+    """
+    problems: List[str] = []
+    if result.get("tarball") is None:
+        problems.append(result.get("tarball_error", "No tarball was produced."))
+        return problems
+    if "cross_section_pb" not in result:
+        problems.append(
+            "BUILD LOOKS FAILED: a tarball exists but the log reports no "
+            "non-zero cross-section. gridpack_generation.sh prints 'Gridpack "
+            "created successfully' even when integration never ran (e.g. a "
+            "compute_widths compilation failure), leaving a tarball with no "
+            "process/ directory. Do NOT shower this. Search the log for "
+            "'MadGraph5Error', 'Error 1' and 'Fail 5 times'."
+        )
+    size = result.get("tarball_bytes") or 0
+    if size and size < 1_000_000:
+        problems.append(
+            f"Tarball is only {size} bytes, far below the few-MB floor for a "
+            "real gridpack -- likely missing its process directory."
+        )
+    return problems
+
+
 def _build_gridpack_script(
     process_name: str,
     rel_carddir: str,
@@ -431,6 +463,7 @@ class GridpackBuildTool(BaseTool):
                 with open(log_path, errors="replace") as fh:
                     result.update(_parse_gridpack_log(fh.read()))
                 result.update(self._find_tarball(mg5_dir))
+                warnings.extend(_verify_build(result))
 
         if warnings:
             result["warnings"] = warnings
