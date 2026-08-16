@@ -106,6 +106,29 @@ def test_rewrite_chain_preserves_campaign_conditions():
     print("[OK] test_rewrite_chain_preserves_campaign_conditions")
 
 
+def test_nanoedm_eventcontent_is_warned_and_overridable():
+    """NANOEDMAODSIM yields an EDM file with no physics branches; say so."""
+    cfgs, warnings = _rewrite_chain(_real_steps(), prefix="MySig",
+                                    events_per_job=100)
+    nano = [c for c in cfgs if c["tier"] == "NanoAOD"][0]
+    if str(nano["flags"].get("eventcontent", "")).upper() == "NANOEDMAODSIM":
+        joined = " ".join(warnings)
+        assert "NANOEDMAODSIM" in joined
+        assert "no Jet_pt/Muon_pt" in joined
+        assert "eventcontent_overrides" in joined
+
+    # Overriding replaces it and reports the change.
+    cfgs2, warnings2 = _rewrite_chain(
+        _real_steps(), prefix="MySig", events_per_job=100,
+        eventcontent_overrides={"NanoAOD": "NANOAODSIM"})
+    nano2 = [c for c in cfgs2 if c["tier"] == "NanoAOD"][0]
+    assert nano2["flags"]["eventcontent"] == "NANOAODSIM"
+    assert any("overridden" in w for w in warnings2)
+    # Conditions are still inherited -- only the format changed.
+    assert nano2["flags"]["conditions"] == nano["flags"]["conditions"]
+    print("[OK] test_nanoedm_eventcontent_is_warned_and_overridable")
+
+
 def test_group_by_release_splits_at_boundaries():
     """A release change means a separate area and a separate condor cluster."""
     cfgs, _ = _rewrite_chain(_real_steps(), prefix="MySig", events_per_job=100)
@@ -216,6 +239,7 @@ def main():
         test_short_tier,
         test_rewrite_chain_repoints_every_input,
         test_rewrite_chain_preserves_campaign_conditions,
+        test_nanoedm_eventcontent_is_warned_and_overridable,
         test_group_by_release_splits_at_boundaries,
         test_cmsdriver_command_shape,
     ]

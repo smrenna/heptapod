@@ -76,6 +76,7 @@ def _rewrite_chain(
     steps: List[Dict[str, Any]],
     prefix: str,
     events_per_job: int,
+    eventcontent_overrides: Optional[Dict[str, str]] = None,
 ) -> Tuple[List[Dict[str, Any]], List[str]]:
     """
     Re-point every step's input at the previous step's output.
@@ -102,6 +103,30 @@ def _rewrite_chain(
         tier = _short_tier(flags.get("step", ""), idx)
         fileout = f"{prefix}_{tier}.root"
         name = f"{prefix}_{tier}_cfg.py"
+
+        # Output FORMAT is not a campaign condition. McM's NanoAOD step ships
+        # --eventcontent NANOEDMAODSIM, which writes an EDM file: 1390 branches
+        # named EventAuxiliary, edmTriggerResults_... and no Jet_pt/Muon_pt at
+        # all. uproot opens it happily and reports the right event count, so
+        # the sample looks fine until an analysis asks for a physics branch.
+        # Carrying it verbatim is faithful and useless; say so.
+        if (eventcontent_overrides or {}).get(tier):
+            was = flags.get("eventcontent")
+            flags["eventcontent"] = eventcontent_overrides[tier]
+            warnings.append(
+                f"Step {idx + 1} ({tier}): eventcontent overridden "
+                f"{was!r} -> {flags['eventcontent']!r} as requested."
+            )
+        elif str(flags.get("eventcontent", "")).upper() == "NANOEDMAODSIM":
+            warnings.append(
+                f"Step {idx + 1} ({tier}) uses --eventcontent NANOEDMAODSIM, "
+                "carried verbatim from the campaign. That writes an EDM file, "
+                "NOT the flat NanoAOD tree: it has no Jet_pt/Muon_pt branches, "
+                "yet opens cleanly and reports the correct event count, so the "
+                "failure only shows up when an analysis reads it. For an "
+                "analysable ntuple pass "
+                f"eventcontent_overrides={{'{tier}': 'NANOAODSIM'}}."
+            )
 
         original_filein = step.get("filein")
         if idx == 0:
@@ -308,6 +333,13 @@ class CMSDriverChainTool(BaseTool):
         description="GEN fragment for the root step. For a reproduction "
         "without the central sample's filters, this is your edited copy.",
     )
+    eventcontent_overrides: Optional[Dict[str, str]] = RuntimeField(
+        default=None,
+        description="Per-tier --eventcontent overrides, e.g. "
+        "{'NanoAOD': 'NANOAODSIM'} to get a flat analysable tree instead of "
+        "the campaign's NANOEDMAODSIM. Output FORMAT is the one cmsDriver "
+        "setting you usually should NOT inherit; conditions still are.",
+    )
     events: int = RuntimeField(
         default=100,
         description="Events for the root step. Later steps read all input.",
@@ -354,7 +386,8 @@ class CMSDriverChainTool(BaseTool):
             work_dir = os.path.join(self.base_directory, work_dir)
         os.makedirs(work_dir, exist_ok=True)
 
-        cfgs, warnings = _rewrite_chain(raw, self.prefix, self.events)
+        cfgs, warnings = _rewrite_chain(raw, self.prefix, self.events,
+                                        self.eventcontent_overrides)
         groups = _group_by_release(cfgs)
 
         if any(c["needs_fragment"] for c in cfgs) and not self.fragment_path:
