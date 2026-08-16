@@ -295,11 +295,16 @@ class GridpackBuildTool(BaseTool):
             )
 
         genprod = os.path.realpath(self.genproductions_dir)
+        genprod_root = genprod
         mg5_dir = os.path.join(genprod, "bin", "MadGraph5_aMCatNLO")
         if not os.path.isdir(mg5_dir):
-            # Caller may have passed the MG5 subdir directly.
+            # Caller may have passed the MG5 subdir directly; recover the root,
+            # which is what has to be visible inside the container.
             if os.path.isfile(os.path.join(genprod, "gridpack_generation.sh")):
                 mg5_dir = genprod
+                parent = os.path.dirname(os.path.dirname(genprod))
+                if os.path.isdir(os.path.join(parent, "Utilities")):
+                    genprod_root = parent
             else:
                 return self.format_error(
                     error="genproductions not found",
@@ -346,7 +351,14 @@ class GridpackBuildTool(BaseTool):
             )
 
         # --- where the container must be launched from --------------------
-        bind_paths = [mg5_dir]
+        # The genproductions ROOT, not the MG5 subdir: gridpack_generation.sh
+        # resolves its helpers as
+        #     script_dir=${PRODHOME%genproductions*}/genproductions/Utilities/scripts
+        # and reads MetaData/pdflist_*_run3.dat from the same level. Bind only
+        # bin/MadGraph5_aMCatNLO and those vanish, and the $DEFAULT_PDF_SETS
+        # substitution quietly falls through to "not using the recommended PDF
+        # sets" instead of failing.
+        bind_paths = [genprod_root]
         if model_path:
             if not os.path.exists(model_path):
                 warnings.append(
@@ -355,6 +367,15 @@ class GridpackBuildTool(BaseTool):
                     "will fail there."
                 )
             bind_paths.append(model_path)
+        build_dir = self.build_dir or self.base_directory
+        if not os.path.isabs(build_dir):
+            build_dir = os.path.join(self.base_directory, build_dir)
+        os.makedirs(build_dir, exist_ok=True)
+        # The script itself must be readable from inside the container, so
+        # where we WRITE it constrains where we can launch from just as much
+        # as what it reads.
+        bind_paths.append(build_dir)
+
         launch_dir = _common_launch_dir(bind_paths)
         if model_path:
             warnings.append(
@@ -363,11 +384,6 @@ class GridpackBuildTool(BaseTool):
                 "genproductions and the model. Only the cwd is bind-mounted; "
                 "launching from either directory alone hides the other."
             )
-
-        build_dir = self.build_dir or self.base_directory
-        if not os.path.isabs(build_dir):
-            build_dir = os.path.join(self.base_directory, build_dir)
-        os.makedirs(build_dir, exist_ok=True)
 
         script_path = os.path.join(build_dir,
                                    f"build_{self.process_name}_gridpack.sh")

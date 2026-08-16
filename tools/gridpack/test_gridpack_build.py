@@ -235,6 +235,48 @@ def test_tool_warns_on_missing_model(tmp_path: Path):
     print("[OK] test_tool_warns_on_missing_model")
 
 
+def test_launch_dir_includes_genproductions_root(tmp_path: Path):
+    """The build reads Utilities/ and MetaData/ ABOVE bin/MadGraph5_aMCatNLO."""
+    mg5 = _fake_genproductions(tmp_path)
+    root = tmp_path / "genproductions"
+    (root / "Utilities" / "scripts").mkdir(parents=True)
+    (root / "MetaData").mkdir()
+    cards = _cards(tmp_path)
+
+    tool = GridpackBuildTool(base_directory=str(tmp_path))
+    r = json.loads(tool.execute(
+        process_name="MyProc", cards_dir=str(cards),
+        genproductions_dir=str(root), scram_arch="el8_amd64_gcc10"))
+
+    launch = Path(r["launch_dir"]).resolve()
+    # Both helper trees must be visible from the launch dir, or the
+    # $DEFAULT_PDF_SETS substitution silently degrades.
+    assert str((root / "Utilities").resolve()).startswith(str(launch))
+    assert str((root / "MetaData").resolve()).startswith(str(launch))
+    assert str(mg5.resolve()).startswith(str(launch))
+    print("[OK] test_launch_dir_includes_genproductions_root")
+
+
+def test_launch_dir_covers_the_script_itself(tmp_path: Path):
+    """The container must be able to read the script it is told to run."""
+    root = tmp_path / "genproductions"
+    _fake_genproductions(tmp_path)
+    cards = _cards(tmp_path)
+    build = tmp_path / "elsewhere" / "work"      # deliberately NOT under root
+
+    tool = GridpackBuildTool(base_directory=str(tmp_path))
+    r = json.loads(tool.execute(
+        process_name="MyProc", cards_dir=str(cards),
+        genproductions_dir=str(root), scram_arch="el8_amd64_gcc10",
+        build_dir=str(build)))
+
+    launch = Path(r["launch_dir"]).resolve()
+    assert str(Path(r["script"]).resolve()).startswith(str(launch)), \
+        "script written outside the bind mount would be invisible in the container"
+    assert str(root.resolve()).startswith(str(launch))
+    print("[OK] test_launch_dir_covers_the_script_itself")
+
+
 def test_tool_rejects_bad_inputs(tmp_path: Path):
     """Unknown arch, absent genproductions, and missing fields are hard errors."""
     _fake_genproductions(tmp_path)
@@ -301,6 +343,8 @@ def main():
         test_tool_copies_outside_cards_and_goes_relative,
         test_tool_launch_dir_covers_local_model,
         test_tool_warns_on_missing_model,
+        test_launch_dir_includes_genproductions_root,
+        test_launch_dir_covers_the_script_itself,
         test_tool_rejects_bad_inputs,
         test_generated_script_is_valid_bash,
         test_verify_only_mode,
