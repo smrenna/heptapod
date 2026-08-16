@@ -128,6 +128,7 @@ def test_cmsdriver_command_shape():
     assert root.startswith("cmsDriver.py")
     assert "Configuration/GenProduction/python/frag.py" in root
     assert "--no_exec --mc" in root
+    assert root.count("--mc") == 1, "McM's own --mc must not be duplicated"
     assert "-n 100" in root
     assert "--python_filename MySig_GS_cfg.py" in root
     assert "--fileout file:MySig_GS.root" in root

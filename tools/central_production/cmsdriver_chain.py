@@ -36,6 +36,9 @@ SCHEMA_VERSION = "cmsdriver-chain-1.0"
 _DROP_FLAGS = {
     "number", "n", "number_out", "python_filename", "fileout", "filein",
     "no_exec", "customise_commands",
+    # Emitted explicitly at the end of every command; passing them through as
+    # well would duplicate them on the command line.
+    "mc", "data",
 }
 
 # Order matters only for readability of the emitted command.
