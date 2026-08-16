@@ -96,6 +96,53 @@ If (2) returns anything, `M$InteractionOrderHierarchy` or the `InteractionOrder`
 tags are missing. Fix the `.fr` and regenerate. **Do not run MG5 first** — it
 will fail with an error that points somewhere else.
 
+## Editing an existing UFO instead of regenerating it
+
+Sometimes the change you need is smaller than a FeynRules round trip — most
+often re-pointing a coupling from one fermion generation to another, when the
+gauge structure is unchanged. That is a legitimate shortcut and it is a
+genuinely small edit: a single-Yukawa model carries **two** vertices for the
+interaction (the vertex and its conjugate), and everything else — gauge
+couplings, colour flow, mass and width machinery — is flavour-blind.
+
+Work on a **copy** with a new directory name, never the original, and change:
+
+- the two `Vertex(...)` entries in `vertices.py`, e.g.
+  `[P.u, P.e__minus__, P.X__tilde__]` → `[P.c, P.mu__minus__, P.X__tilde__]`
+  and its conjugate;
+- the matching `Decay` entries in `decays.py`, including the **mass symbols**
+  inside the partial-width expressions;
+- delete `py3_model.pkl` and `__pycache__/` — a stale pickle shadows the edited
+  source and you will debug the version you did not write.
+
+### Two traps
+
+**Overlapping symbol substitution.** Replacing `Me → MMU` then `MU → MC` turns
+`MMU` into `MMC`, because `MU` matches inside `MMU`. The file still parses,
+`MMC` is not a parameter in the model, and the error only surfaces as a wrong
+width deep inside MG5. Substitute in one pass with word-boundary regexes, or
+order the replacements so no output of one is an input to another.
+
+**No check that the edit is right.** A hand-edited UFO has no test suite. Give
+it one: evaluate the edited width expression directly in Python against a
+closed form. For a scalar decaying to a massless quark–lepton pair through a
+single Yukawa `y`,
+
+```
+Gamma = y^2 * M / (16 pi)
+```
+
+so `y = 0.5`, `M = 2000 GeV` must give **9.947 GeV**. Then confirm MG5 agrees
+by setting `DECAY <pdg> Auto` in `customizecards.dat` and reading the width
+back out of the generated `param_card.dat` — agreement to several digits means
+the vertex, the coupling, and the decay table are all consistent. Do this
+*before* spending a gridpack build.
+
+Finally, check what MG5 actually generated: the LHE's final-state PDG codes
+should be the new flavours and only the new flavours (e.g. equal counts of
+`4`, `-4`, `13`, `-13` and no `2`/`11`), which also confirms the branching
+ratio is 1 by construction.
+
 ## Before writing any `.fr`
 
 Answer these internally. If any answer is "not sure", read the reference file

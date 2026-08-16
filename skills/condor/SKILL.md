@@ -49,15 +49,39 @@ this and warns before you submit.
 Measured details, and a probe job for re-verifying them at another site, are in
 `references/lpc_environment.md`.
 
-## Four silent failures the tool exists to prevent
+## Seven silent failures the tool exists to prevent
 
-**1. Unseeded jobs.** `queue 100` without per-job seeds gives 100 identical
-copies of the same events. Nothing errors; the merged sample simply has a
-hundredth of the statistics it appears to. The generated wrapper derives
-`SEED = first_seed + $(Process)` and applies it to *every* module registered
-with `RandomNumberGeneratorService` — `generator`, `externalLHEProducer`,
-`VtxSmeared`, whatever the cfg has — plus `firstLuminosityBlock`, so merged
-output has no duplicate lumi IDs.
+Every one of these produces a job that exits 0 and writes a plausible file.
+
+**1. Unseeded jobs — identical physics.** `queue 100` without per-job seeds
+gives 100 identical copies of the same events. Nothing errors; the merged
+sample simply has a hundredth of the statistics it appears to. The generated
+wrapper derives `SEED = first_seed + $(Process)` and applies it to *every*
+module registered with `RandomNumberGeneratorService` — `generator`,
+`externalLHEProducer`, `VtxSmeared`, whatever the cfg has.
+
+**1b. Seeded jobs — identical event IDs.** Distinct physics is *not* enough,
+and this is the half that gets missed. `EmptySource` numbers events
+`(run 1, lumi 1, event 1..N)` regardless of any RNG seed, so N genuinely
+different jobs still emit colliding identifiers. Nothing complains until those
+files are chained into a later step, where PoolSource's duplicate check
+discards all but the first — opening and closing each of the others within the
+same second and saying so only at information level:
+
+```
+Duplicate Events found in entire set of input files.
+The duplicate will be skipped.
+some events were skipped because of duplicate checking.
+```
+
+Five 20-event jobs then yield a valid, correct-looking 20-event AODSIM. The
+wrapper therefore also sets `firstLuminosityBlock` per job — unconditionally
+for an `EmptySource`, because `cmsDriver` does not write that parameter and a
+`hasattr` guard silently skips it.
+
+**The check that catches both:** count events in the merged output and compare
+against `n_jobs × events_per_job` *before* running anything downstream. Neither
+failure shows up in a log.
 
 **2. Unset `transfer_output_files`.** The default returns every new file in the
 job's scratch directory. Since the wrapper runs `cmsrel` there, that is a
@@ -77,6 +101,28 @@ reads `transfer_input_files` itself. A submit directory on node-local disk
 (`/tmp`) fails with `(errno 2) No such file or directory` — which reads as a
 missing file and is not. The tool rejects such a `job_dir`;
 `allow_nonshared_submit_dir=True` overrides it where the heuristic is wrong.
+
+**5. A gridpack path that is right on both sides and wrong in the job.**
+`ExternalLHEProducer`'s helper does `mkdir lheevent; cd lheevent` *before*
+`tar -xaf ${path}`, so a bare filename resolves inside `lheevent/` where the
+tarball is not — while a submitting-node absolute path names a filesystem the
+container never mounted. Both die minutes in, during Geant4 init, as a
+`FileOpenError` on `cmsgrid_final.lhe` that names neither cause. The job patch
+rewrites any `externalLHEProducer.args` entry whose basename was transferred
+into scratch to that file's absolute location, leaving genuine `/cvmfs` paths
+alone. Do **not** "fix" such a path to a bare filename by hand.
+
+**6. Output names that don't survive the hop between stages.** The `_<Process>`
+suffix that keeps N jobs' outputs apart is wrong for a fan-of-one: the next
+stage's cfg was written by `cmsDriver --filein file:X.root` and cannot open
+`X_0.root`, dying at PoolSource construction with a bare "No such file or
+directory". The tool suffixes only when `n_jobs > 1`, so a single-job stage
+emits exactly the name cmsRun was told to write.
+
+**7. Grepping the wrong stream for completion.** cmsRun writes
+`TimeReport> Time report complete` to **stderr**. Under condor that is the
+job's `.err` file, so a guard pointed at `.out` finds nothing and condemns
+every healthy job. For a GEN step, the event count is the trustworthy check.
 
 ## Splitting a production chain
 

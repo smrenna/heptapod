@@ -329,6 +329,19 @@ Counts over the ~224 fragments in `cms-gen/genproductions_cards`:
 | `comEnergy` | `13000.` | `13600.` |
 | run card `ebeam1/2` | `6500` | `6800` |
 
+**The authoritative check is the campaign's own fragment**, not this table.
+McM serves it publicly, no grid certificate needed:
+
+```bash
+curl -s -k https://cms-pdmv-prod.web.cern.ch/mcm/public/restapi/requests/get_fragment/<PREPID>
+```
+
+Diff your fragment's imports, hadronizer class and `comEnergy` against it. Done
+for a Run3Summer22EE reference sample, this confirmed all three rows below and
+took one command — and it also shows exactly which generator filters the
+central sample applies, which is what you need if the request is for the same
+conditions *without* the cuts.
+
 Two module paths deserve specific warning because they are plausible and
 wrong: `MCTunesRun3.PythiaCP5Settings_cfi` (no `ECM13p6TeV`) does not exist,
 and the 13.6 TeV CP5 block is **not** a drop-in for the 2017 one — the tune

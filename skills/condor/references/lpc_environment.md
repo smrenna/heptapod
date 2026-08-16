@@ -195,11 +195,43 @@ otherwise, so a proxy made in one shell may not be where another shell looks;
 pass `-out <path>` to pin it. Watch the lifetime too — a proxy with hours left
 will strand jobs that sit idle overnight.
 
+## `condor_submit` cannot be exec'd directly
+
+LPC ships the client tools as Python scripts whose **first line is a shell
+`exec`**, not a `#!` shebang, to work around `LD_LIBRARY_PATH`:
+
+```
+$ head -1 $(which condor_submit)
+exec env LD_LIBRARY_PATH='' /usr/bin/python3 -Ex "$0" "$@"
+```
+
+A shell runs this fine — which is why typing `condor_submit` works — but
+`execve()` rejects it, so any program launching it as a bare argv list gets
+
+```
+[Errno 8] Exec format error: 'condor_submit'
+```
+
+against a completely healthy installation. Retry through `/bin/sh` with the
+script path passed as an *argument* (not as a shell string, so no quoting is
+involved). `CMSSWJobSubmitTool` does this for both `condor_submit` and
+`condor_q`.
+
 ## Splitting a full production chain
 
-The chain steps have very different costs — from the S1 leptoquark run, per
-100 events: GEN-SIM 3896 s, DIGI-HLT 411 s, RECO 574 s, MiniAOD and NanoAOD
-negligible. So:
+The chain steps have very different costs. Two measured 100-event private BSM
+samples, the first run interactively and the second on condor:
+
+| step | 1.5 TeV, interactive | 2 TeV, condor |
+|---|---|---|
+| GEN-SIM | 3896 s | 5 jobs x 20 ev, 1165 s each |
+| DIGI-HLT (premix) | 411 s | 815 s |
+| RAW2DIGI-RECO | 574 s | 1183 s |
+| PAT (MiniAOD) | negligible | 310 s |
+| NANO | negligible | 154 s |
+
+GEN-SIM dominates by an order of magnitude and is the only step that splits by
+seed, which sets the whole strategy:
 
 - **Split GEN-SIM by seed**, one job per few hundred events. This is the step
   that actually needs the farm.
