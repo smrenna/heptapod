@@ -227,6 +227,11 @@ def test_build_script_uses_relative_carddir():
     # it cannot run; MG5 reports only "A compilation Error occurs".
     assert "/cvmfs/sft.cern.ch/lcg/" in text
     assert "VIRTUAL_ENV" in text
+    # make honours $FC directly and never consults PATH, so the compiler
+    # variables -- not PATH -- are what actually leak an EL9 toolchain into
+    # the EL8 container.
+    for var in ("FC", "CC", "CXX", "LD_LIBRARY_PATH"):
+        assert var in text, f"{var} must be unset in the build environment"
     # No absolute carddir anywhere in the invocation.
     assert " /a/b/genproductions/bin/MadGraph5_aMCatNLO/cards" not in text
     print("[OK] test_build_script_uses_relative_carddir")
