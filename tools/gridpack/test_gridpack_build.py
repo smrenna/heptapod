@@ -32,6 +32,7 @@ from tools.gridpack.gridpack_build import (
     _common_launch_dir,
     _container_for_arch,
     _parse_gridpack_log,
+    _check_customizecards,
     _verify_build,
     _proc_card_model_path,
     _relative_carddir,
@@ -175,6 +176,41 @@ def test_verify_build_rejects_a_successful_looking_failure():
     assert _verify_build({"tarball": None,
                           "tarball_error": "nope"}) == ["nope"]
     print("[OK] test_verify_build_rejects_a_successful_looking_failure")
+
+
+def test_customizecards_forbidden_literal(tmp_path: Path):
+    """A COMMENT naming the width command aborts the build; catch it first."""
+    literal = "compute" + "_widths"
+    d = tmp_path / "cards"
+    d.mkdir()
+    ok = d / "MyProc_customizecards.dat"
+    ok.write_text("set param_card mass 9000005 2000\nset param_card decay 9000005 Auto\n")
+    assert _check_customizecards(str(d), "MyProc") is None
+
+    # Only mentioned in a comment -- still fatal to the real script.
+    ok.write_text(f"# avoid {literal} here, it is flaky\nset param_card decay 9000005 Auto\n")
+    msg = _check_customizecards(str(d), "MyProc")
+    assert msg and "line(s) 1" in msg
+    assert "comments are NOT stripped" in msg
+
+    # No card at all is not an error.
+    assert _check_customizecards(str(tmp_path / "absent"), "MyProc") is None
+    print("[OK] test_customizecards_forbidden_literal")
+
+
+def test_tool_rejects_forbidden_literal(tmp_path: Path):
+    """The tool refuses rather than launching a build that will exit 1."""
+    _fake_genproductions(tmp_path)
+    cards = _cards(tmp_path)
+    (cards / "MyProc_customizecards.dat").write_text(
+        "# uses " + "compute" + "_widths\nset param_card mass 9000005 2000\n")
+    tool = GridpackBuildTool(base_directory=str(tmp_path))
+    out = tool.execute(
+        process_name="MyProc", cards_dir=str(cards),
+        genproductions_dir=str(tmp_path / "genproductions"),
+        scram_arch="el8_amd64_gcc10")
+    assert out.startswith("Error:") and "abort the build" in out
+    print("[OK] test_tool_rejects_forbidden_literal")
 
 
 def test_build_script_uses_relative_carddir():
@@ -368,6 +404,8 @@ def main():
     ]
     tmp_tests = [
         test_relative_carddir,
+        test_customizecards_forbidden_literal,
+        test_tool_rejects_forbidden_literal,
         test_tool_copies_outside_cards_and_goes_relative,
         test_tool_launch_dir_covers_local_model,
         test_tool_warns_on_missing_model,

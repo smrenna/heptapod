@@ -136,6 +136,50 @@ def _parse_gridpack_log(text: str) -> Dict[str, Any]:
     return result
 
 
+# gridpack_generation.sh greps the raw customizecards for this string and
+# `exit 1`s on a match -- WITHOUT stripping comments, so merely mentioning it
+# in a comment aborts the build. Built from pieces so this module's own source
+# is not a false positive when someone greps a checkout.
+_FORBIDDEN_CARD_LITERAL = "compute" + "_widths"
+
+
+def _check_customizecards(cards_dir: str, process_name: str) -> Optional[str]:
+    """
+    Catch the literal that makes gridpack_generation.sh abort.
+
+    The guard in the script is
+
+        if grep -F "<literal>" $CARDSDIR/${name}_customizecards.dat ; then
+            echo ...
+            exit 1;
+
+    i.e. a raw substring match over the whole file. A card that only *mentions*
+    the command in an explanatory comment is killed the same as one that uses
+    it, and the message reads as advice rather than as a fatal error.
+    """
+    path = os.path.join(cards_dir, f"{process_name}_customizecards.dat")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return None
+    if _FORBIDDEN_CARD_LITERAL not in text:
+        return None
+    lines = [str(i + 1) for i, ln in enumerate(text.splitlines())
+             if _FORBIDDEN_CARD_LITERAL in ln]
+    return (
+        f"{os.path.basename(path)} contains the literal "
+        f"'{_FORBIDDEN_CARD_LITERAL}' on line(s) {', '.join(lines)}. "
+        "gridpack_generation.sh greps the raw file for it and exits 1 -- "
+        "comments are NOT stripped, so even mentioning it in a comment aborts "
+        "the build after printing what looks like mere advice. Use explicit "
+        "widths, or `set param_card decay <pdg> Auto`, and do not name the "
+        "command anywhere in the card."
+    )
+
+
 def _verify_build(result: Dict[str, Any]) -> List[str]:
     """
     Decide whether a finished build actually produced anything usable.
@@ -367,6 +411,15 @@ class GridpackBuildTool(BaseTool):
                 f"passed as the relative path {rel!r}. The originals in "
                 f"{cards_src} remain authoritative -- edit those and re-run, "
                 "or the two copies drift."
+            )
+
+        # --- customizecards: a literal in here can abort the build --------
+        card_error = _check_customizecards(os.path.join(mg5_dir, rel),
+                                           self.process_name)
+        if card_error:
+            return self.format_error(
+                error="customizecards would abort the build",
+                reason=card_error,
             )
 
         # --- proc card: does it import a model by absolute path? ----------
