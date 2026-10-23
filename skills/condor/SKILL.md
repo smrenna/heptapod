@@ -204,7 +204,10 @@ condor_history <cluster>
 ```
 
 `condor_ssh_to_job` is the fastest way to settle an environment question — it
-drops you in the job's scratch directory inside the same container.
+drops you in the job's scratch directory inside the same container. It is not
+installed everywhere (an opportunistic pool's login node may lack it); there,
+use `condor_tail` for live stdout or the probe job in
+`references/lpc_environment.md`.
 
 ## Reference files
 
@@ -215,6 +218,9 @@ drops you in the job's scratch directory inside the same container.
 
 ## Related skills
 
+- **`cmsconnect`** — the same work on an opportunistic pool reached over
+  ssh: forced site/wall-time defaults, no shared filesystem, one release chain
+  per job, and Premix files that must be resident at the site read from.
 - **`cmssw`** — building the gridpack and writing the GEN fragment that
   produce the cfg submitted here, plus the pitfalls that make a cfg wrong
   before batch is even involved.
