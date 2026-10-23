@@ -1098,17 +1098,34 @@ def _parse_cluster_id(stdout: str) -> Optional[str]:
 class CondorJobStatusTool(BaseTool):
     """
     Report the state of an HTCondor cluster: per-status counts, hold reasons,
-    and the tail of a failing job's log.
+    finished-job exit codes and wall times, live progress of running jobs, and
+    the tail of a failing job's log.
 
     Read-only. Note that at sites which load-balance across schedd hosts, a
     plain `condor_q <cluster>` may not find a job submitted through a
     different schedd -- pass schedd_name (condor_submit reports which one it
     used) when a known-live cluster comes back empty.
 
+    Remote pools: set remote_host (user@login-node) and every condor command
+    runs there over ssh with BatchMode (key auth only). That is the same host
+    CMSSWJobSubmitTool(remote_host=...) submitted through.
+
+    Waiting: wait_seconds > 0 polls until the cluster has no idle, running,
+    held-free work left or the time is up, then reports. Keep it below your
+    agent's own per-call timeout (a few minutes); call again to keep waiting.
+    The result's `done` flag says whether every job has left the queue, and
+    `all_succeeded` whether each exited 0 (from condor_history).
+
     Input:
         cluster_id: the cluster to query.
         schedd_name: schedd host, if the cluster is not on the default one.
-        job_dir: directory holding logs/, for tailing a held job's stderr.
+        job_dir: directory holding logs/, for tailing a held job's stderr
+            (local submissions; for remote ones the logs are on remote_host).
+        remote_host / ssh_key: run the condor commands over ssh.
+        wait_seconds / poll_seconds: bounded polling, see above.
+        include_history: also report finished jobs (exit code, wall time, host).
+        tail_running: lines of live stdout to show for up to 3 running jobs
+            (condor_tail; stdout only -- other files are not permitted).
     """
 
     # ======================== Runtime fields ======================== #
@@ -1122,6 +1139,27 @@ class CondorJobStatusTool(BaseTool):
     job_dir: Optional[str] = RuntimeField(
         default=None,
         description="Job directory containing logs/, for error-log tails.")
+    remote_host: Optional[str] = RuntimeField(
+        default=None,
+        description="user@host: run condor_q/condor_history/condor_tail on "
+        "this submit node over ssh (BatchMode, key auth).")
+    ssh_key: Optional[str] = RuntimeField(
+        default=None, description="Private key for remote_host (optional).")
+    wait_seconds: int = RuntimeField(
+        default=0,
+        description="Poll for up to this many seconds until no job is idle, "
+        "running or held-and-retrying (i.e. the cluster has left the queue). "
+        "0 = single query. Keep below the agent's per-call timeout.")
+    poll_seconds: int = RuntimeField(
+        default=30, description="Seconds between polls when waiting.")
+    include_history: bool = RuntimeField(
+        default=True,
+        description="Add finished jobs from condor_history: exit code, wall "
+        "time and host per job.")
+    tail_running: int = RuntimeField(
+        default=0,
+        description="If > 0, show this many lines of live stdout for up to "
+        "three running jobs, via condor_tail (progress, e.g. which step).")
     # ================================================================ #
 
     # ========================= State fields ========================= #
@@ -1139,40 +1177,43 @@ class CondorJobStatusTool(BaseTool):
     def _setup(self):
         self.base_directory = os.path.abspath(self.base_directory)
 
-    def _run(self) -> str:
-        if not self.cluster_id:
-            return self.format_error(
-                error="Missing required input",
-                reason="cluster_id must be provided.",
-            )
+    def _exec(self, cmd: List[str], timeout: int = 120):
+        """Run a condor command locally or, with remote_host, over ssh."""
+        if self.remote_host:
+            remote = " ".join(shlex.quote(c) for c in cmd)
+            return subprocess.run(
+                _ssh_base(self.remote_host, self.ssh_key) + [remote],
+                capture_output=True, text=True, timeout=timeout)
+        return _run_condor_cmd(cmd, capture_output=True, text=True,
+                               timeout=timeout)
 
+    def _queue(self):
+        """-> (counts, holds, per_job, error_string_or_None)"""
         cmd = ["condor_q"]
         if self.schedd_name:
             cmd += ["-name", self.schedd_name]
-        cmd += [str(self.cluster_id), "-af", "ProcId", "JobStatus", "HoldReason"]
-
+        cmd += [str(self.cluster_id), "-af", "ProcId", "JobStatus",
+                "HoldReason"]
         try:
-            completed = _run_condor_cmd(
-                cmd, capture_output=True, text=True, timeout=120)
+            completed = self._exec(cmd)
         except FileNotFoundError:
-            return self.format_error(
-                error="condor_q not found",
-                reason="HTCondor client tools are not on PATH.",
-                suggestion="Run this from a submit node.",
-            )
+            return None, None, None, self.format_error(
+                error=("ssh not found" if self.remote_host
+                       else "condor_q not found"),
+                reason=("ssh is not on PATH." if self.remote_host
+                        else "HTCondor client tools are not on PATH."),
+                suggestion="Run this from a submit node.")
         except subprocess.TimeoutExpired:
-            return self.format_error(
+            return None, None, None, self.format_error(
                 error="condor_q timed out", reason="No response within 120 s.")
-
         if completed.returncode != 0:
-            return self.format_error(
+            return None, None, None, self.format_error(
                 error="condor_q failed",
                 reason=completed.stderr.strip(),
-                context=" ".join(shlex.quote(c) for c in cmd),
-            )
-
+                context=" ".join(shlex.quote(c) for c in cmd))
         counts: Dict[str, int] = {}
         holds: List[Dict[str, str]] = []
+        per_job: Dict[str, str] = {}
         for line in completed.stdout.splitlines():
             if not line.strip():
                 continue
@@ -1183,8 +1224,71 @@ class CondorJobStatusTool(BaseTool):
             reason = parts[2].strip() if len(parts) > 2 else ""
             name = self._STATUS_NAMES.get(status, f"unknown({status})")
             counts[name] = counts.get(name, 0) + 1
+            per_job[proc] = name
             if name == "held" and reason and reason != "undefined":
                 holds.append({"proc": proc, "reason": reason})
+        return counts, holds, per_job, None
+
+    def _history(self) -> List[Dict[str, str]]:
+        cmd = ["condor_history"]
+        if self.schedd_name:
+            cmd += ["-name", self.schedd_name]
+        cmd += [str(self.cluster_id), "-af", "ProcId", "JobStatus",
+                "ExitCode", "RemoteWallClockTime", "LastRemoteHost"]
+        try:
+            completed = self._exec(cmd, timeout=180)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return []
+        if completed.returncode != 0:
+            return []
+        rows = []
+        for line in completed.stdout.splitlines():
+            f = line.split()
+            if len(f) < 5:
+                continue
+            rows.append({
+                "proc": f[0],
+                "status": self._STATUS_NAMES.get(f[1], f"unknown({f[1]})"),
+                "exit_code": f[2],
+                "wall_seconds": f[3],
+                "host": f[4].split("@")[-1],
+            })
+        rows.sort(key=lambda r: int(r["proc"]) if r["proc"].isdigit() else 0)
+        return rows
+
+    def _tail(self, proc: str, nlines: int) -> str:
+        cmd = ["condor_tail"]
+        if self.schedd_name:
+            cmd += ["-name", self.schedd_name]
+        cmd += [f"{self.cluster_id}.{proc}"]
+        try:
+            done = self._exec(["timeout", "40"] + cmd, timeout=60)
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            return ""
+        lines = [l for l in done.stdout.splitlines() if l.strip()]
+        return "\n".join(lines[-nlines:])
+
+    def _run(self) -> str:
+        if not self.cluster_id:
+            return self.format_error(
+                error="Missing required input",
+                reason="cluster_id must be provided.",
+            )
+
+        # Bounded wait: poll until nothing is left in the queue.
+        deadline = time.time() + max(0, int(self.wait_seconds))
+        polls = 0
+        while True:
+            counts, holds, per_job, err = self._queue()
+            polls += 1
+            if err:
+                return err
+            busy = any(counts.get(k, 0) for k in
+                       ("idle", "running", "transferring_output", "suspended"))
+            if not self.wait_seconds or not busy or time.time() >= deadline:
+                break
+            time.sleep(max(1, min(int(self.poll_seconds),
+                                  max(1, deadline - time.time()))))
 
         result: Dict[str, Any] = {
             "status": "ok",
@@ -1192,14 +1296,44 @@ class CondorJobStatusTool(BaseTool):
             "cluster_id": str(self.cluster_id),
             "counts": counts,
         }
+        if self.wait_seconds:
+            result["polls"] = polls
         if not counts:
             result["note"] = (
                 "No jobs in the queue for this cluster: it either finished "
-                "(check condor_history) or lives on another schedd (pass "
-                "schedd_name)."
+                "(see `finished` from condor_history) or lives on another "
+                "schedd (pass schedd_name)."
             )
         if holds:
             result["held_jobs"] = holds[:20]
+
+        if self.include_history:
+            fin = self._history()
+            if fin:
+                result["finished"] = fin
+                ok = [r for r in fin if r["status"] == "completed"
+                      and r["exit_code"] == "0"]
+                result["n_succeeded"] = len(ok)
+                result["n_failed"] = sum(
+                    1 for r in fin
+                    if r["status"] == "completed" and r["exit_code"] != "0")
+
+        in_queue = sum(counts.values())
+        result["done"] = in_queue == 0
+        if result["done"] and "finished" in result:
+            result["all_succeeded"] = (
+                result["n_failed"] == 0 and result["n_succeeded"] > 0
+                and not any(r["status"] == "removed"
+                            for r in result["finished"]))
+
+        if self.tail_running and per_job:
+            running = [p for p, st in sorted(per_job.items(),
+                                             key=lambda kv: int(kv[0]))
+                       if st == "running"][:3]
+            tails = {p: self._tail(p, int(self.tail_running)) for p in running}
+            tails = {p: t for p, t in tails.items() if t}
+            if tails:
+                result["live_stdout"] = tails
 
         job_dir = self.job_dir
         if job_dir:

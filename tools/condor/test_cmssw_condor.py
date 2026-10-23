@@ -753,6 +753,104 @@ def test_status_tool_tails_error_logs(tmp_path: Path):
     print("[OK] test_status_tool_tails_error_logs")
 
 
+def _fake_condor(queue_outputs, history="", tail="", calls=None):
+    """subprocess.run stand-in: condor_q answers come from a queue (one per poll)."""
+    class _R:
+        def __init__(self, out, rc=0):
+            self.stdout, self.stderr, self.returncode = out, "", rc
+
+    def fake(cmd, **kw):
+        joined = " ".join(cmd)
+        if calls is not None:
+            calls.append(list(cmd))
+        if "condor_history" in joined:
+            return _R(history)
+        if "condor_tail" in joined:
+            return _R(tail)
+        if "condor_q" in joined:
+            return _R(queue_outputs.pop(0) if len(queue_outputs) > 1
+                      else queue_outputs[0])
+        return _R("")
+    return fake
+
+
+def test_status_tool_wait_polls_until_queue_empty(tmp_path: Path):
+    """wait_seconds polls; the result says done and whether all jobs exited 0."""
+    history = ("0 4 0 2442 slot1@glidein_1@wn1.example.org\n"
+               "1 4 0 2170 slot1@glidein_2@wn2.example.org\n")
+    original, orig_sleep = mod.subprocess.run, mod.time.sleep
+    mod.subprocess.run = _fake_condor(
+        ["0 2 undefined\n1 2 undefined\n", "0 2 undefined\n", ""], history)
+    mod.time.sleep = lambda s: None
+    try:
+        tool = CondorJobStatusTool(base_directory=str(tmp_path))
+        result = json.loads(tool.execute(
+            cluster_id="9", wait_seconds=600, poll_seconds=1))
+    finally:
+        mod.subprocess.run, mod.time.sleep = original, orig_sleep
+
+    assert result["polls"] == 3 and result["done"] is True
+    assert result["n_succeeded"] == 2 and result["n_failed"] == 0
+    assert result["all_succeeded"] is True
+    assert result["finished"][0]["host"] == "wn1.example.org"
+    print("[OK] test_status_tool_wait_polls_until_queue_empty")
+
+
+def test_status_tool_wait_gives_up_at_deadline(tmp_path: Path):
+    """A never-finishing cluster returns (done=False) instead of hanging."""
+    original, orig_sleep = mod.subprocess.run, mod.time.sleep
+    mod.subprocess.run = _fake_condor(["0 2 undefined\n"])
+    clock = {"t": 1000.0}
+    orig_time = mod.time.time
+    mod.time.time = lambda: clock["t"]
+    mod.time.sleep = lambda s: clock.__setitem__("t", clock["t"] + s)
+    try:
+        tool = CondorJobStatusTool(base_directory=str(tmp_path))
+        result = json.loads(tool.execute(
+            cluster_id="9", wait_seconds=100, poll_seconds=30))
+    finally:
+        mod.subprocess.run, mod.time.sleep, mod.time.time = (
+            original, orig_sleep, orig_time)
+    assert result["done"] is False and 3 <= result["polls"] <= 6
+    assert "all_succeeded" not in result
+    print("[OK] test_status_tool_wait_gives_up_at_deadline")
+
+
+def test_status_tool_failed_job_is_reported(tmp_path: Path):
+    original = mod.subprocess.run
+    mod.subprocess.run = _fake_condor(
+        [""], "0 4 0 100 a@b@h1\n1 4 1 50 a@b@h2\n")
+    try:
+        result = json.loads(CondorJobStatusTool(
+            base_directory=str(tmp_path)).execute(cluster_id="9"))
+    finally:
+        mod.subprocess.run = original
+    assert result["done"] is True and result["all_succeeded"] is False
+    assert result["n_failed"] == 1
+    print("[OK] test_status_tool_failed_job_is_reported")
+
+
+def test_status_tool_remote_and_live_tail(tmp_path: Path):
+    """remote_host wraps every condor command in ssh; tail_running adds stdout."""
+    calls = []
+    original = mod.subprocess.run
+    mod.subprocess.run = _fake_condor(
+        ["0 2 undefined\n"], tail="line a\n== step 3/7: sim\n", calls=calls)
+    try:
+        result = json.loads(CondorJobStatusTool(
+            base_directory=str(tmp_path)).execute(
+                cluster_id="9", remote_host="u@login.example.org",
+                include_history=False, tail_running=1))
+    finally:
+        mod.subprocess.run = original
+    assert all(c[0] == "ssh" and "BatchMode=yes" in c for c in calls)
+    # argv is: ssh -o ... <host> '<quoted remote command>'
+    assert all(c[-2] == "u@login.example.org" for c in calls)
+    assert "condor_q" in calls[0][-1] and "condor_tail" in calls[-1][-1]
+    assert result["live_stdout"]["0"] == "== step 3/7: sim"
+    print("[OK] test_status_tool_remote_and_live_tail")
+
+
 def test_generated_wrapper_is_valid_bash(tmp_path: Path):
     """The emitted wrapper must at least parse under bash -n."""
     cfg = _write_cfg(tmp_path)
@@ -991,6 +1089,10 @@ def main():
         test_status_tool_parses_condor_q,
         test_status_tool_empty_queue_explains_schedd,
         test_status_tool_tails_error_logs,
+        test_status_tool_wait_polls_until_queue_empty,
+        test_status_tool_wait_gives_up_at_deadline,
+        test_status_tool_failed_job_is_reported,
+        test_status_tool_remote_and_live_tail,
         test_generated_wrapper_is_valid_bash,
         test_chain_wrapper_is_valid_bash_and_python,
         test_premix_patch_picks_distinct_files_per_job,
