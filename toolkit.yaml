@@ -206,12 +206,17 @@ tools:
       description and wrapper encoding per-job random seeds, an explicit
       transfer_output_files, and the apptainer image matching SCRAM_ARCH;
       checks the cfg for paths the worker node cannot reach. use_condor=False
-      emits an equivalent local run script instead.
+      emits an equivalent local run script instead. Also: several steps across
+      CMSSW releases in one job (steps=), premix file selection per job,
+      site/OS classads for pools that need them, and remote submission over
+      ssh (remote_host=).
     bundle: condor
   - module: tools.condor.cmssw_condor
     name: CondorJobStatusTool
     description: Report an HTCondor cluster's per-status counts, hold reasons,
-      and failing jobs' error-log tails.
+      finished-job exit codes and wall times, live stdout of running jobs, and
+      failing jobs' error-log tails. Can poll for a bounded time (wait_seconds)
+      and query a remote submit node over ssh (remote_host=).
     bundle: condor
   - module: tools.central_production.cmsdriver_chain
     name: CMSDriverChainTool
@@ -227,6 +232,13 @@ tools:
       ordered, structured chain of production steps (release, SCRAM_ARCH,
       parsed cmsDriver args) that actually produced it, from GEN-SIM through
       the requested tier.
+    bundle: central_production
+  - module: tools.central_production.premix_files
+    name: PremixFileListTool
+    description: List a premix pileup dataset's files that are on disk at a
+      given site (dasgoclient block route) as xrootd URLs, written one per
+      line for CMSSWJobSubmitTool(premix_list=). Avoids empty or unresolved
+      mixData file lists and reads from sites that do not hold the data.
     bundle: central_production
   - module: tools.eda.compute_symbolic_amplitude_tool
     name: ComputeSymbolicAmplitude
