@@ -189,7 +189,7 @@ def _parse_mcm_setup_script(script_text: str, prepid: str) -> Dict[str, Any]:
 
 def _resolve_parent_prepid(
     filein: Optional[str],
-    dasgoclient_fn=_dasgoclient_mcm_prepid,
+    dasgoclient_fn=None,
 ) -> Tuple[Optional[str], Optional[str]]:
     """
     Given the first cmsDriver command's --filein value for a request,
@@ -209,6 +209,11 @@ def _resolve_parent_prepid(
       a private/non-McM predecessor, or pileup input -- which is filtered
       out by the caller before this is reached), the walk stops there.
     """
+    if dasgoclient_fn is None:
+        # Looked up at call time, not bound as a default, so the module-level
+        # name can be replaced (tests, or a site-specific resolver).
+        dasgoclient_fn = _dasgoclient_mcm_prepid
+
     if not filein:
         return None, None
 
@@ -356,8 +361,8 @@ class MCMChainTool(BaseTool):
 
 def _walk_and_parse_chain(
     start_prepid: str,
-    get_setup_fn=_mcm_get_setup,
-    resolve_parent_fn=_resolve_parent_prepid,
+    get_setup_fn=None,
+    resolve_parent_fn=None,
 ) -> Tuple[List[Tuple[str, Dict[str, Any]]], List[str]]:
     """
     Fetch and parse get_setup for start_prepid and every ancestor, walking
@@ -366,6 +371,11 @@ def _walk_and_parse_chain(
     Returns (chain, warnings) where chain is [(prepid, parsed_setup), ...]
     ordered root (GEN-SIM) first, terminal (start_prepid) last.
     """
+    if get_setup_fn is None:
+        get_setup_fn = _mcm_get_setup
+    if resolve_parent_fn is None:
+        resolve_parent_fn = _resolve_parent_prepid
+
     chain: List[Tuple[str, Dict[str, Any]]] = []
     warnings: List[str] = []
     prepid = start_prepid
