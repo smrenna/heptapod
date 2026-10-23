@@ -44,7 +44,7 @@ bundles:
 
   # ── analysis stack ───────────────────────────────────────────────
   analysis:
-    deps: [numpy>=2.3.5, tqdm>=4.67.0, pylhe>=1.0.2]
+    deps: [numpy>=2.3.5, tqdm>=4.67.0, pylhe>=1.0.2, uproot>=5.3]
 
   # ── BSM / SUSY spectrum setup ────────────────────────────────────
   # Pure python (no external HEP software): parse benchmark-point spectra
@@ -103,6 +103,13 @@ bundles:
   # not from this toolkit's venv.
   central_production: {}
 tools:
+  - module: tools.analysis.nano_to_jsonl
+    name: NanoAODToJSONLTool
+    description: Convert flat NanoAOD (NANOAODSIM) files into reco-level JSONL
+      events (electrons, muons, photons, jets, MET) for the cutflow, selection
+      and reconstruction tools. Concatenates per-job files and warns on
+      duplicated (run, lumi, event) ids. Needs uproot.
+    bundle: analysis
   - module: tools.analysis.conversions
     name: EventJSONLToNumpyTool
     description: Convert a JSONL event dataset into a zero-padded NumPy array.
