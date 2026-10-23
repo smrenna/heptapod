@@ -32,6 +32,7 @@ from tools.condor import cmssw_condor as mod
 from tools.condor.cmssw_condor import (
     CMSSWJobSubmitTool,
     CondorJobStatusTool,
+    _build_chain_wrapper,
     _build_jdl,
     _build_wrapper,
     _check_submit_dir,
@@ -777,6 +778,186 @@ def test_generated_wrapper_is_valid_bash(tmp_path: Path):
     print("[OK] test_generated_wrapper_is_valid_bash")
 
 
+# ====================================================================== #
+# ============ Multi-release chain, premix, remote submission ========== #
+# ====================================================================== #
+
+CHAIN_STEPS = [
+    {"cfg": "gen_cfg.py", "cmssw_release": "CMSSW_10_6_19_patch3",
+     "scram_arch": "slc7_amd64_gcc700", "output": "gen.root"},
+    {"cfg": "sim_cfg.py", "cmssw_release": "CMSSW_10_6_17_patch1",
+     "scram_arch": "slc7_amd64_gcc700", "input": "gen.root", "output": "sim.root"},
+    {"cfg": "nano_cfg.py", "cmssw_release": "CMSSW_10_6_26",
+     "scram_arch": "slc7_amd64_gcc700", "input": "sim.root", "output": "nano.root"},
+]
+
+
+def test_chain_wrapper_uses_one_subshell_and_release_per_step():
+    """Each step gets its own release in a subshell; inputs are cleaned up."""
+    text = _build_chain_wrapper(
+        steps=CHAIN_STEPS, first_seed=700, premix_list="/x/premix.txt")
+    for rel in ("CMSSW_10_6_19_patch3", "CMSSW_10_6_17_patch1", "CMSSW_10_6_26"):
+        assert f"run_step {rel} slc7_amd64_gcc700" in text
+    # Order preserved.
+    assert text.index("run_step CMSSW_10_6_19_patch3") < \
+           text.index("run_step CMSSW_10_6_17_patch1") < \
+           text.index("run_step CMSSW_10_6_26")
+    # The runtime is evaluated inside "( ... )" so releases cannot leak into each other.
+    body = text[text.index("run_step() {"):text.index("# --- step 1/3")]
+    assert body.count("( export SCRAM_ARCH=$2") == 1 and ")" in body
+    # A consumed intermediate is removed; the first step has no input to remove.
+    assert "rm -f gen.root" in text and "rm -f sim.root" in text
+    # Per-job premix selection is exported.
+    assert 'HEPTAPOD_PREMIX_LIST="$WORK/premix.txt"' in text
+    assert "XrdSecGSISRVNAMES" in text
+    print("[OK] test_chain_wrapper_uses_one_subshell_and_release_per_step")
+
+
+def test_chain_wrapper_is_valid_bash_and_python(tmp_path: Path):
+    text = _build_chain_wrapper(steps=CHAIN_STEPS, first_seed=1,
+                                keep_outputs=["nano.root"])
+    path = tmp_path / "w.sh"
+    path.write_text(text)
+    done = subprocess.run(["bash", "-n", str(path)], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    tag = "<<'HEPTAPOD_SEED_PATCH'"
+    start = text.index(tag) + len(tag)
+    compile(text[start:text.index("HEPTAPOD_SEED_PATCH", start)], "patch", "exec")
+    assert 'mv "nano.root" "nano_${PROC}.root"' in text
+    print("[OK] test_chain_wrapper_is_valid_bash_and_python")
+
+
+def test_premix_patch_picks_distinct_files_per_job(tmp_path: Path):
+    """Run the injected premix block for two jobs against a stub `process`."""
+    lst = tmp_path / "premix.txt"
+    lst.write_text("\n".join(f"/store/premix/f{i}.root" for i in range(40)) + "\n")
+    patch = mod._build_seed_patch()
+    picked = {}
+    for proc in (0, 1):
+        ns_code = (
+            "import os, types, sys\n"
+            "class _V(list):\n"
+            "    pass\n"
+            "cms = types.ModuleType('cms'); cms.untracked = types.SimpleNamespace("
+            "vstring=lambda *a: list(a), uint32=lambda x: x)\n"
+            "fwc = types.ModuleType('FWCore'); pc = types.ModuleType('FWCore.ParameterSet'); "
+            "cfg = types.ModuleType('FWCore.ParameterSet.Config'); "
+            "cfg.untracked = cms.untracked; cfg.vstring = lambda *a: list(a)\n"
+            "sys.modules.update({'FWCore': fwc, 'FWCore.ParameterSet': pc, "
+            "'FWCore.ParameterSet.Config': cfg}); fwc.ParameterSet = pc; pc.Config = cfg\n"
+            "process = types.SimpleNamespace(mixData=types.SimpleNamespace("
+            "input=types.SimpleNamespace(fileNames=None)))\n"
+            + patch.replace("import FWCore.ParameterSet.Config as cms\n", "from FWCore.ParameterSet import Config as cms\n")
+        )
+        env = dict(os.environ, HEPTAPOD_SEED=str(100 + proc), HEPTAPOD_PROC=str(proc),
+                   HEPTAPOD_PREMIX_LIST=str(lst), HEPTAPOD_PREMIX_N="4",
+                   HEPTAPOD_PREMIX_PREFIX="root://xrd.example//")
+        script = ns_code + "\nprint('PICK', process.mixData.input.fileNames)\n"
+        done = subprocess.run([sys.executable, "-c", script], env=env,
+                              capture_output=True, text=True)
+        assert done.returncode == 0, done.stderr
+        line = [l for l in done.stdout.splitlines() if l.startswith("PICK")][0]
+        picked[proc] = eval(line[len("PICK "):])
+    assert len(picked[0]) == 4 and len(set(picked[0])) == 4
+    assert all(f.startswith("root://xrd.example///store/premix/") for f in picked[0])
+    assert set(picked[0]).isdisjoint(picked[1])
+    print("[OK] test_premix_patch_picks_distinct_files_per_job")
+
+
+def test_jdl_extra_classads_and_native_mode():
+    text = _build_jdl(
+        executable="run.sh", transfer_input_files=["/a/x.py", "/b/y.txt"],
+        output_files=["o.root"], image="/img", n_jobs=2, request_cpus=1,
+        request_memory_mb=4000, request_disk_kb=1, proxy_path="/r/proxy",
+        stage_out_to_eos=False,
+        extra_classads={"REQUIRED_OS": '"rhel7"', "MaxWallTimeMins": "480"},
+        flat_inputs=True, use_apptainer_image=False)
+    assert '+REQUIRED_OS' in text and '"rhel7"' in text
+    assert "+MaxWallTimeMins" in text and "480" in text
+    assert "transfer_input_files    = x.py, y.txt" in text
+    assert "+ApptainerImage" not in text
+    print("[OK] test_jdl_extra_classads_and_native_mode")
+
+
+def test_tool_chain_mode_writes_one_job(tmp_path: Path):
+    for name in ("gen_cfg.py", "sim_cfg.py", "nano_cfg.py"):
+        _write_cfg(tmp_path, name=name)
+    tool = CMSSWJobSubmitTool(base_directory=str(tmp_path))
+    result = json.loads(tool.execute(
+        steps=[dict(st, cfg=str(tmp_path / st["cfg"])) for st in CHAIN_STEPS],
+        n_jobs=3, output_files=["nano.root"], proxy_path="/remote/proxy",
+        required_os="rhel7", desired_sites=["T1_US_FNAL", "T2_US_Wisconsin"],
+        max_wall_time_mins=480, use_apptainer_image=False,
+        allow_nonshared_submit_dir=True))
+    assert result["status"] == "ok", result
+    jdl = Path(result["written"]["jdl"]).read_text()
+    assert 'DESIRED_Sites' in jdl and "T1_US_FNAL,T2_US_Wisconsin" in jdl
+    assert "+ApptainerImage" not in jdl and "nano_$(Process).root" in jdl
+    wrapper = Path(result["written"]["wrapper"]).read_text()
+    assert wrapper.count("run_step CMSSW_") == 3
+    print("[OK] test_tool_chain_mode_writes_one_job")
+
+
+def test_tool_chain_rejects_mixed_os_and_conflicts(tmp_path: Path):
+    for name in ("a_cfg.py", "b_cfg.py"):
+        _write_cfg(tmp_path, name=name)
+    mixed = [
+        {"cfg": str(tmp_path / "a_cfg.py"), "cmssw_release": "CMSSW_10_6_17",
+         "scram_arch": "slc7_amd64_gcc700"},
+        {"cfg": str(tmp_path / "b_cfg.py"), "cmssw_release": "CMSSW_13_0_13",
+         "scram_arch": "el8_amd64_gcc11"},
+    ]
+    tool = CMSSWJobSubmitTool(base_directory=str(tmp_path))
+    out = tool.execute(steps=mixed, allow_nonshared_submit_dir=True)
+    assert out.startswith("Error:") and "operating systems" in out
+    out = tool.execute(steps=mixed[:1], cfg_file=str(tmp_path / "a_cfg.py"),
+                       allow_nonshared_submit_dir=True)
+    assert out.startswith("Error:") and "Conflicting" in out
+    out = tool.execute(steps=[{"cfg": "x"}], allow_nonshared_submit_dir=True)
+    assert out.startswith("Error:") and "Incomplete steps" in out
+    print("[OK] test_tool_chain_rejects_mixed_os_and_conflicts")
+
+
+def test_remote_submit_rsyncs_flat_and_exports_proxy(tmp_path: Path):
+    """No network: record the ssh/rsync argv the remote path would run."""
+    calls = []
+
+    class _Done:
+        returncode = 0
+        stdout = "2 job(s) submitted to cluster 4242."
+        stderr = ""
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+        return _Done()
+
+    cfg = _write_cfg(tmp_path)
+    original = mod.subprocess.run
+    mod.subprocess.run = fake_run
+    try:
+        tool = CMSSWJobSubmitTool(base_directory=str(tmp_path))
+        result = json.loads(tool.execute(
+            cfg_file=str(cfg), cmssw_release="CMSSW_10_6_17_patch1",
+            scram_arch="slc7_amd64_gcc700", n_jobs=2, submit=True,
+            remote_host="user@login.example.org", remote_dir="~/jobs",
+            proxy_path="/home/user/jobs/x509up", ssh_key="~/.ssh/id_test",
+            required_os="rhel7", use_apptainer_image=False,
+            allow_nonshared_submit_dir=True))
+    finally:
+        mod.subprocess.run = original
+
+    assert result["submitted"] is True and result["cluster_id"] == "4242"
+    flat = [c for c in calls if c and c[0] == "rsync"]
+    assert flat and flat[0][-1] == "user@login.example.org:~/jobs/"
+    assert "BatchMode=yes" in " ".join(calls[0])
+    last = " ".join(calls[-1])
+    assert "export X509_USER_PROXY=/home/user/jobs/x509up" in last
+    assert "condor_submit submit.jdl" in last
+    assert "transfer_input_files    = step1_cfg.py" in Path(
+        result["written"]["jdl"]).read_text()
+    print("[OK] test_remote_submit_rsyncs_flat_and_exports_proxy")
+
+
 def main():
     simple_tests = [
         test_image_for_arch,
@@ -791,6 +972,8 @@ def main():
         test_jdl_always_sets_transfer_output_files,
         test_parse_cluster_id,
         test_run_condor_cmd_retries_on_enoexec,
+        test_chain_wrapper_uses_one_subshell_and_release_per_step,
+        test_jdl_extra_classads_and_native_mode,
     ]
     tmp_tests = [
         test_tool_defaults_to_condor,
@@ -809,6 +992,11 @@ def main():
         test_status_tool_empty_queue_explains_schedd,
         test_status_tool_tails_error_logs,
         test_generated_wrapper_is_valid_bash,
+        test_chain_wrapper_is_valid_bash_and_python,
+        test_premix_patch_picks_distinct_files_per_job,
+        test_tool_chain_mode_writes_one_job,
+        test_tool_chain_rejects_mixed_os_and_conflicts,
+        test_remote_submit_rsyncs_flat_and_exports_proxy,
     ]
 
     print("=" * 70)
