@@ -110,6 +110,14 @@ tools:
       and reconstruction tools. Concatenates per-job files and warns on
       duplicated (run, lumi, event) ids. Needs uproot.
     bundle: analysis
+  - module: tools.analysis.histogram
+    name: NormalizedHistogramTool
+    description: Fill a luminosity-normalised histogram (pt, eta, any
+      per-object key, or two-object invariant mass) from one or more
+      reco-level JSONL files. Merges files and normalises with the total
+      generated-event count (sigma x lumi / N_generated) with Poisson errors,
+      and warns when n_generated is assumed or the range is empty.
+    bundle: analysis
   - module: tools.analysis.conversions
     name: EventJSONLToNumpyTool
     description: Convert a JSONL event dataset into a zero-padded NumPy array.
