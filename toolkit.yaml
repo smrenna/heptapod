@@ -206,7 +206,7 @@ tools:
       description and wrapper encoding per-job random seeds, an explicit
       transfer_output_files, and the apptainer image matching SCRAM_ARCH;
       checks the cfg for paths the worker node cannot reach. use_condor=False
-      emits an equivalent local run script instead. Also: several steps across
+      emits an equivalent local run script instead. Also supports several steps across
       CMSSW releases in one job (steps=), premix file selection per job,
       site/OS classads for pools that need them, and remote submission over
       ssh (remote_host=).
