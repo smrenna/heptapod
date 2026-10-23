@@ -100,6 +100,19 @@ def test_container_for_arch():
     print("[OK] test_container_for_arch")
 
 
+def test_old_toolchain_arch_warns_about_python():
+    """Pre-gcc9 arches get a (hedged) Python warning; modern ones do not."""
+    from tools.gridpack.gridpack_build import _old_python_arch_warning
+    w = _old_python_arch_warning("slc7_amd64_gcc700")
+    assert w and "Python" in w and "may" in w and "slc7_amd64_gcc10" in w
+    assert _old_python_arch_warning("el8_amd64_gcc10") is None
+    assert _old_python_arch_warning("el9_amd64_gcc12") is None
+    assert _old_python_arch_warning("slc7_amd64_gcc10") is None
+    assert _old_python_arch_warning("weird") is None
+    assert _old_python_arch_warning("") is None
+    print("[OK] test_old_toolchain_arch_warns_about_python")
+
+
 def test_proc_card_model_path():
     """Only an ABSOLUTE import imposes a bind-mount constraint."""
     assert _proc_card_model_path(PROC_CARD_LOCAL_MODEL) == "/models/MyBSM_UFO"
@@ -426,6 +439,7 @@ def test_verify_only_mode(tmp_path: Path):
 def main():
     simple = [
         test_container_for_arch,
+        test_old_toolchain_arch_warns_about_python,
         test_proc_card_model_path,
         test_common_launch_dir,
         test_parse_gridpack_log,

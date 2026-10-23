@@ -55,6 +55,40 @@ _XSEC_RE = re.compile(r"Cross-section\s*:\s*([0-9.eE+-]+)\s*\+-\s*([0-9.eE+-]+)\
 # ========================= Helper functions =========================== #
 # ====================================================================== #
 
+_GCC_RE = re.compile(r"_gcc(\d+)$")
+
+
+def _old_python_arch_warning(scram_arch: str) -> Optional[str]:
+    """
+    Warn when the arch's toolchain is old enough to carry an old Python.
+
+    Observed: under slc7_amd64_gcc700 the environment's Python is 3.6, and
+    MG5_aMC 2.9.18 (what genproductions fetches) refused to run; a gcc10-era
+    arch built fine. Other pre-gcc9 arches were not tested, hence "may".
+    The gridpack is compiled for the arch it is built under, so building under
+    a newer arch than the showering release is NOT a free fix: see the arch
+    note below.
+    """
+    m = _GCC_RE.search(scram_arch or "")
+    if not m:
+        return None
+    digits = int(m.group(1))
+    # SCRAM spells old toolchains as major*100+minor*10 (gcc700 = 7.0,
+    # gcc630 = 6.3) and new ones as the major alone (gcc10, gcc12).
+    major = digits // 100 if len(m.group(1)) >= 3 else digits
+    if major >= 9:
+        return None
+    return (
+        f"{scram_arch} is an older toolchain whose Python may be too old for "
+        "MG5_aMC 2.9.x (Python 3.6 under slc7_amd64_gcc700 was refused). If "
+        "the build aborts on the Python version, build under a newer arch "
+        "such as slc7_amd64_gcc10 -- the LHE step is compiled MadGraph "
+        "output, and the showering release must be one that can use a "
+        "gridpack built that way; check that the pair is compatible before "
+        "launching a long build."
+    )
+
+
 def _container_for_arch(scram_arch: str) -> Optional[str]:
     """el8_amd64_gcc10 -> cmssw-el8. None for an unrecognized arch."""
     if not scram_arch:
@@ -503,6 +537,10 @@ class GridpackBuildTool(BaseTool):
                 "genproductions and the model. Only the cwd is bind-mounted; "
                 "launching from either directory alone hides the other."
             )
+
+        py_warn = _old_python_arch_warning(self.scram_arch)
+        if py_warn:
+            warnings.append(py_warn)
 
         script_path = os.path.join(build_dir,
                                    f"build_{self.process_name}_gridpack.sh")
